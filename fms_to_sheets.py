@@ -734,6 +734,43 @@ def fetch_vehicles() -> list[dict]:
     return lst
 
 
+def fetch_vehicle_id_map() -> dict[str, int]:
+    """
+    Return {VEHICLE_NUMBER_UPPER: vehicleId} for all vehicles in the account.
+    The tracking-report API needs the numeric vehicleId, not the plate number.
+    Tries two generic-data type values; falls back to an empty dict on failure.
+    """
+    url = f"{BASE_API}/masters/post/json/getUserGenericData"
+    base_payload = {
+        "text": "", "by": "itemName", "exact": False,
+        "listOfParam": ["id", "itemName"],
+        "numberOfRecords": 9999,
+        "userId": USER_ID,
+    }
+    for type_val in ("vehicles", "vehicle"):
+        try:
+            body = _api_post(url, {**base_payload, "type": type_val})
+            data = extract_list(body) if isinstance(body, dict) else (body or [])
+            result: dict[str, int] = {}
+            for item in data:
+                name = str(item.get("itemName") or "").strip().upper()
+                vid  = item.get("id")
+                if name and vid:
+                    try:
+                        result[name] = int(vid)
+                    except (ValueError, TypeError):
+                        pass
+            if result:
+                print(f"  [API] {len(result)} vehicle IDs loaded "
+                      f"(type='{type_val}')", flush=True)
+                return result
+        except Exception:
+            continue
+    print("  [API] Could not load vehicle ID map — arrival-time lookup disabled",
+          flush=True)
+    return {}
+
+
 def fetch_hub_locations() -> tuple[dict[str, tuple[float, float]], list[list]]:
     """
     Try to load hub GPS coordinates from the FMS master-data API.
@@ -783,6 +820,123 @@ def fetch_hub_locations() -> tuple[dict[str, tuple[float, float]], list[list]]:
     print("  [API] No hub coordinates from API — GPS via-check disabled",
           flush=True)
     return {}, []
+
+
+def fetch_actual_arrival_time(
+        vehicle_no:         str,
+        vehicle_id_map:     dict[str, int],
+        final_hub_code:     str,
+        final_hub_coords:   tuple[float, float] | None,
+        dispatch_dt:        datetime,
+        hub_coords_by_code: dict[str, tuple[float, float]],
+) -> str:
+    """
+    Query the FMS Tracking Report for `vehicle_no` and find the **earliest**
+    GPS point that is AT the final destination hub, after the dispatch time.
+
+    Strategy (first match wins for each point):
+      1. If final hub code is in hub_coords_by_code → GPS distance ≤ 2 km
+      2. Point's location text contains the final hub code (case-insensitive)
+      3. Point's location text starts with 'AT' and contains final hub name tokens
+
+    Returns a formatted string "DD/MM/YYYY HH:MM:SS", or "" if not found.
+    """
+    vid = vehicle_id_map.get(vehicle_no.upper())
+    if not vid:
+        return ""   # unknown vehicle — fall back to datetime.now()
+
+    url = f"{BASE_API}/report/post/json/getTrackingReport"
+    # Search from dispatch time up to 10 days ahead (capped at now)
+    to_dt  = min(dispatch_dt + timedelta(days=10), datetime.now())
+    payload = {
+        "userId":    USER_ID,
+        "vehicleId": vid,
+        "fromDate":  dispatch_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "toDate":    to_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "interval":  5,   # 5-minute resolution
+    }
+    try:
+        body  = _api_post(url, payload, max_retries=2, base_delay=1.0)
+        points = extract_list(body) if isinstance(body, dict) else (body or [])
+    except Exception as exc:
+        print(f"  [TrackRpt] {vehicle_no}: API error — {exc}", flush=True)
+        return ""
+
+    if not points:
+        return ""
+
+    # Hub name tokens for text-fallback matching
+    hub_code_upper = final_hub_code.upper() if final_hub_code else ""
+    hub_coords     = final_hub_coords or (hub_coords_by_code.get(hub_code_upper)
+                                          if hub_code_upper else None)
+
+    # Field names tried for timestamp and location (vary across API versions)
+    _TIME_FIELDS = ("dateTime", "datetime", "gpsTime", "gps_time",
+                    "timestamp", "locationTime", "time")
+    _LOC_FIELDS  = ("location", "lastLocation", "address", "landmark",
+                    "locationName", "place")
+    _LAT_FIELDS  = ("latitude",  "lat")
+    _LON_FIELDS  = ("longitude", "lon", "lng")
+
+    def _get(point: dict, fields: tuple) -> str:
+        for f in fields:
+            v = point.get(f)
+            if v is not None and str(v).strip() not in ("", "null", "None"):
+                return str(v).strip()
+        return ""
+
+    earliest: datetime | None = None
+
+    for pt in points:
+        ts_raw = _get(pt, _TIME_FIELDS)
+        if not ts_raw:
+            continue
+        pt_dt = _parse_since_dt(ts_raw)
+        if not pt_dt or pt_dt <= dispatch_dt:
+            continue
+        # Already found an earlier match — no need to check further
+        if earliest and pt_dt >= earliest:
+            continue
+
+        at_dest = False
+
+        # Check 1: GPS distance to final hub
+        if hub_coords:
+            try:
+                p_lat = float(_get(pt, _LAT_FIELDS) or 0)
+                p_lon = float(_get(pt, _LON_FIELDS) or 0)
+                if p_lat and p_lon:
+                    dist_km = haversine_m(p_lat, p_lon, *hub_coords) / 1000
+                    if dist_km <= 2.0:
+                        at_dest = True
+            except (ValueError, TypeError):
+                pass
+
+        # Check 2: location text contains the hub code
+        if not at_dest and hub_code_upper:
+            loc_text = _get(pt, _LOC_FIELDS).upper()
+            if hub_code_upper in loc_text:
+                at_dest = True
+
+        # Check 3: location starts with "AT" and hub name tokens match
+        if not at_dest and hub_code_upper:
+            loc_text = _get(pt, _LOC_FIELDS)
+            if loc_text.strip().upper().startswith("AT "):
+                # Extract code from parentheses e.g. "AT safexpress vijayawada (VWR11)"
+                code_in_loc = _extract_hub_code_from_location(loc_text)
+                if code_in_loc and code_in_loc.upper() == hub_code_upper:
+                    at_dest = True
+
+        if at_dest:
+            earliest = pt_dt
+
+    if earliest:
+        result = earliest.strftime("%d/%m/%Y %H:%M:%S")
+        print(f"  [TrackRpt] {vehicle_no}: actual arrival at "
+              f"{hub_code_upper or 'dest'} = {result}", flush=True)
+        return result
+
+    return ""
 
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
@@ -1107,7 +1261,8 @@ def build_row(v: dict, sno: int, existing_arrival: str,
               hub_coords_by_code: dict | None = None,
               route_hub_names:    list[str] | None = None,
               sla_map:            dict | None = None,
-              vehicle_route_map:  dict | None = None) -> list:
+              vehicle_route_map:  dict | None = None,
+              vehicle_id_map:     dict | None = None) -> list:
     stage, _  = derive_stage(v, hub_coords, consignee_codes, hub_coords_by_code,
                              prev_snap, route_hub_names)
     status    = derive_status(v, stage)
@@ -1138,14 +1293,34 @@ def build_row(v: dict, sno: int, existing_arrival: str,
         via_since = api_since
 
     # Arrival timestamp rules:
-    #   • "Reached-Unloading" + no timestamp yet      → write now
-    #     (fires on the isOnTrip flip from "Almost Reached")
+    #   • "Reached-Unloading" + no timestamp yet      → query FMS Tracking Report
+    #     for the ACTUAL first-arrival time at the final hub; fall back to now()
     #   • "Reached-Unloading" + already written       → None (keep; don't overwrite)
     #   • "Almost Reached" + existing timestamp       → None (preserve; not yet reached)
     #   • Any other stage  + existing timestamp       → "" (stale; vehicle on new trip)
     #   • Any other stage  + no timestamp             → None (nothing to do)
     if stage == "Reached-Unloading" and not existing_arrival:
-        arrival = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        # Find the actual arrival time: earliest GPS point AT the final hub
+        # that occurred AFTER the route start (dispatch) time.
+        actual_arrival = ""
+        vno_str        = fmt(v.get("vehicleNumber"))
+        dispatch_str   = fmt(v.get("dispatchDate"))
+        dispatch_dt    = _parse_since_dt(dispatch_str) if dispatch_str else None
+        final_code     = (consignee_codes[-1].upper()
+                          if consignee_codes else "")
+        final_coords   = ((hub_coords_by_code or {}).get(final_code)
+                          if final_code else None)
+        if dispatch_dt and vno_str and vehicle_id_map:
+            actual_arrival = fetch_actual_arrival_time(
+                vno_str,
+                vehicle_id_map,
+                final_code,
+                final_coords,
+                dispatch_dt,
+                hub_coords_by_code or {},
+            )
+        # Fall back to detection time only when the Tracking Report had no data
+        arrival = actual_arrival or datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     elif stage not in ("Reached-Unloading", "Almost Reached") and existing_arrival:
         arrival = ""     # stale arrival from a previous trip — wipe it
     else:
@@ -1381,23 +1556,115 @@ def _write_trip_row(ss, ws: gspread.Worksheet, r: int, data: dict):
 
 
 def _write_completed_trip(trip_ss, tab_name: str, trip_data: dict):
-    """Append a completed trip to the MIS tab. Silently skips duplicates."""
+    """
+    Append a completed trip to the MIS tab (one row per RPS). Silently skips
+    duplicates. End_Time must already be set in trip_data by the caller
+    (it comes from the locked Route_Reaching_Date_Time in the Tracking sheet).
+    """
     rps_no = trip_data.get("RPS_Number", "")
     if not rps_no:
         return
     ws = _get_or_create_trip_tab(trip_ss, tab_name)
     if rps_no in ws.col_values(1):
-        return   # already logged
-    end_time = fetch_rps_closure(
-        rps_no,
-        trip_data.get("Vehicle_Number", ""),
-        trip_data.get("Start_Time", ""),
-    )
-    trip_data["End_Time"] = end_time
+        return   # already logged — dedup
+    # End_Time is the GPS-confirmed Route_Reaching_Date_Time passed by caller.
+    # No need to re-query the RPS API; that time is already accurate.
     row_num = len(ws.col_values(1)) + 1
     _write_trip_row(trip_ss, ws, row_num, trip_data)
-    print(f"  [Trip/{tab_name}] Logged RPS {rps_no} "
-          f"(end={end_time or 'pending'})", flush=True)
+    end_str = trip_data.get("End_Time", "") or "(pending)"
+    print(f"  [✓ Trip→{tab_name}] RPS {rps_no} | {trip_data.get('Vehicle_Number','')} "
+          f"| Arrival: {end_str}", flush=True)
+
+
+def sync_reached_to_trip_sheet(hub_ws, trip_sheet_id,
+                                sla_map, vt_sheet, dry_run=False):
+    """
+    Read hub Tracking sheet directly. Copy every row where
+      Current_Stage == "Reached-Unloading" AND
+      Route_Reaching_Date_Time is filled AND
+      RPS_No is filled
+    to the correct monthly MIS tab in the trip sheet.
+    Skips RPS numbers already present (dedup via col-A check).
+    Returns count of rows newly written.
+    """
+    if not trip_sheet_id or dry_run:
+        return 0
+
+    all_rows = hub_ws.get_all_values()
+    if len(all_rows) < 2:
+        return 0
+
+    header = [h.strip() for h in all_rows[0]]
+
+    def ci(name, default):
+        try:
+            return header.index(name)
+        except ValueError:
+            return default
+
+    ci_stage   = ci("Current_Stage",            10)
+    ci_arrival = ci("Route_Reaching_Date_Time",   8)
+    ci_rps     = ci("RPS_No",                     2)
+    ci_vno     = ci("Vehicle_No",                 3)
+    ci_route   = ci("Route",                      5)
+    ci_rcode   = ci("Route_Code",                 6)
+    ci_start   = ci("Route_Start_Date_Time",       7)
+    ci_driver  = ci("Driver_Name",               15)
+    ci_dcode   = ci("Driver_Code",               16)
+    ci_adv     = ci("Given_Advance",             17)
+    ci_diesel  = ci("Given_Diesel",              18)
+    ci_damt    = ci("Diesel_Amount",             19)
+    ci_toll    = ci("Given_Toll",                20)
+    ci_challan = ci("Given_Challan",             21)
+    ci_xdsl    = ci("Extra_Diesel",              22)
+    ci_maint   = ci("Maintainance",              23)
+
+    def cell(row, idx):
+        return row[idx].strip() if idx < len(row) else ""
+
+    trip_ss = _gspread_client().open_by_key(trip_sheet_id)
+    copied  = 0
+
+    for row in all_rows[1:]:
+        stage   = cell(row, ci_stage)
+        arrival = cell(row, ci_arrival)
+        rps     = cell(row, ci_rps)
+
+        if stage != "Reached-Unloading" or not arrival or not rps:
+            continue
+
+        vno     = cell(row, ci_vno)
+        start   = cell(row, ci_start)
+        rcode   = cell(row, ci_rcode)
+        tat_hrs = sla_map.get(rcode.upper()) if rcode else None
+
+        start_dt = _parse_since_dt(start)
+        tab_name = (start_dt.strftime("%B_%Y_MIS") if start_dt
+                    else datetime.now().strftime("%B_%Y_MIS"))
+
+        trip_data = {
+            "RPS_Number":     rps,
+            "Vehicle_Number": vno,
+            "Vehicle_Size":   vt_sheet.get(vno, ""),
+            "Driver_Name":    cell(row, ci_driver),
+            "Driver_Code":    cell(row, ci_dcode),
+            "Route":          cell(row, ci_route),
+            "Route_Code":     rcode,
+            "Route_TAT":      tat_hrs / 24 if tat_hrs else "",
+            "Start_Time":     start,
+            "End_Time":       arrival,
+            "Given_Advance":  cell(row, ci_adv),
+            "Given_Diesel":   cell(row, ci_diesel),
+            "Diesel_Amount":  cell(row, ci_damt),
+            "Given_Toll":     cell(row, ci_toll),
+            "Given_Challan":  cell(row, ci_challan),
+            "Extra_Diesel":   cell(row, ci_xdsl),
+            "Maintainance":   cell(row, ci_maint),
+        }
+        _write_completed_trip(trip_ss, tab_name, trip_data)
+        copied += 1
+
+    return copied
 
 
 # ── Main update ────────────────────────────────────────────────────────────────
@@ -1533,6 +1800,9 @@ def load_shared(ss, vehicles: list[dict]) -> dict:
         print("  [Route SLA] No SLA hours yet — using FMS delay until filled",
               flush=True)
 
+    # ── Vehicle ID map (plate → numeric id) — for Tracking Report lookups ───
+    vehicle_id_map = fetch_vehicle_id_map()
+
     return {
         "hub_coords":         hub_coords,
         "hub_coords_by_code": hub_coords_by_code,
@@ -1546,6 +1816,7 @@ def load_shared(ss, vehicles: list[dict]) -> dict:
         "sla_map":            sla_map,
         "existing_sla_codes": existing_sla_codes,
         "sla_ws":             sla_ws,
+        "vehicle_id_map":     vehicle_id_map,
     }
 
 
@@ -1572,6 +1843,7 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
     sla_map            = shared["sla_map"]
     existing_sla_codes = shared["existing_sla_codes"]
     sla_ws             = shared["sla_ws"]
+    vehicle_id_map     = shared.get("vehicle_id_map", {})
 
     # ── Tracking: read once. Indexed by Vehicle_No so user-sort doesn't matter.
     all_rows = ws.get_all_values()
@@ -1645,7 +1917,6 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
             vno = (v.get("vehicleNumber") or "").strip()
             if not vno or vno not in assignments:
                 continue
-
             codes_str       = (v.get("consigneeCode") or "").strip()
             consignee_codes = [c.strip() for c in codes_str.split(";") if c.strip()] \
                               if codes_str else []
@@ -1654,6 +1925,81 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
             consignee_names = [n.strip() for n in (v.get("consigneeName") or "").split(";")
                                if n.strip()]
             route_hub_names = consignee_names  # origin is not a via stop
+
+            row_num   = assignments[vno]
+            sno       = row_num - DATA_START + 1
+            prev_snap = stage_snapshot.get(vno, {})
+
+            stage, stage_color = derive_stage(v, hub_coords, consignee_codes,
+                                              hub_coords_by_code, prev_snap,
+                                              route_hub_names)
+            status             = derive_status(v, stage)
+            stage_map[vno]     = stage
+
+            # ── Per-cell freeze (vno-indexed; survives any sort of Tracking) ─
+            trk_row    = row_num
+            shd_row    = shadow_row_of[vno]
+            live_row   = live_by_vno.get(vno)        # None if new in Tracking
+            shadow_row = shadow_by_vno.get(vno)      # None if new in shadow
+            cur_rps    = fmt(v.get("tripId")) if v.get("isOnTrip") else ""
+            shadow_rps = (shadow_row[2].strip() if shadow_row and len(shadow_row) > 2 else "")
+            new_trip   = (shadow_row is None) or (bool(cur_rps) and cur_rps != shadow_rps)
+
+            # ── Completed trip detection ──────────────────────────────────────
+            # confirmed_arrival = Route_Reaching_Date_Time already in the sheet
+            # (lock_vals holds what was there before this cycle's writes).
+            # rps_no_snap = the RPS from the snapshot (prev cycle).
+            confirmed_arrival = lock_vals.get(vno, "")
+            rps_no_snap       = prev_snap.get("rps", "")
+
+            # Console: log first-time arrival (stage just flipped to Reached-Unloading)
+            prev_stage = prev_snap.get("stage", "")
+            if stage == "Reached-Unloading" and prev_stage != "Reached-Unloading":
+                arrival_label = confirmed_arrival or "(arrival time → next cycle)"
+                print(f"  [▶ REACHED] {vno} | RPS {rps_no_snap or 'unknown'} "
+                      f"| Arrival: {arrival_label}", flush=True)
+
+            # Copy to trip sheet when:
+            #   A) Stage is still Reached-Unloading AND arrival confirmed, OR
+            #   B) Stage just left Reached-Unloading (LAST CHANCE before arrival
+            #      gets wiped this cycle) — catches the FMS trip-close cycle.
+            # Dedup inside _write_completed_trip prevents double rows per RPS.
+            should_copy = (
+                trip_sheet_id and not dry_run
+                and confirmed_arrival
+                and rps_no_snap
+                and (stage == "Reached-Unloading"          # still at dest
+                     or prev_stage == "Reached-Unloading") # just left dest
+            )
+            if should_copy:
+                def _lv(col: int, _row=live_row) -> str:
+                    return (_row[col].strip()
+                            if _row and col < len(_row) else "")
+                live_rcode = _lv(6)
+                if live_rcode in ("Not Assigned", NOT_ASSIGNED, ""):
+                    live_rcode = prev_snap.get("route", "")
+                if live_rcode in ("Not Assigned", NOT_ASSIGNED):
+                    live_rcode = ""
+                tat_hrs = sla_map.get(live_rcode.upper()) if live_rcode else None
+                completed_trips.append({
+                    "RPS_Number":     rps_no_snap,
+                    "Vehicle_Number": vno,
+                    "Vehicle_Size":   vt_sheet.get(vno, ""),
+                    "Driver_Name":    _lv(15),
+                    "Driver_Code":    _lv(16),
+                    "Route":          _lv(5),
+                    "Route_Code":     live_rcode,
+                    "Route_TAT":      tat_hrs / 24 if tat_hrs else "",
+                    "Start_Time":     _lv(7),
+                    "End_Time":       confirmed_arrival,   # GPS-confirmed arrival
+                    "Given_Advance":  _lv(17),
+                    "Given_Diesel":   _lv(18),
+                    "Diesel_Amount":  _lv(19),
+                    "Given_Toll":     _lv(20),
+                    "Given_Challan":  _lv(21),
+                    "Extra_Diesel":   _lv(22),
+                    "Maintainance":   _lv(23),
+                })
 
             # Queue planned hubs missing coords for manual entry (master only).
             if do_side_effects and v.get("isOnTrip"):
@@ -1667,53 +2013,6 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
                         continue
                     missing_coord_hubs.setdefault(hcode, nm.strip())
 
-            row_num   = assignments[vno]
-            sno       = row_num - DATA_START + 1
-            prev_snap = stage_snapshot.get(vno, {})
-
-            stage, stage_color = derive_stage(v, hub_coords, consignee_codes,
-                                              hub_coords_by_code, prev_snap,
-                                              route_hub_names)
-            status             = derive_status(v, stage)
-            stage_map[vno]     = stage
-
-            # ── Completed trip detection ──────────────────────────────────────
-            # Fires when isOnTrip just flipped False and vehicle is at destination.
-            # Capture data from live_row (still has the on-trip values before we
-            # overwrite them with "Not Assigned" in this cycle's batch_update).
-            if (trip_sheet_id and not dry_run
-                    and not v.get("isOnTrip")
-                    and stage == "Reached-Unloading"):
-                rps_no = prev_snap.get("rps", "")
-                if rps_no:
-                    def _lv(col: int, _row=live_row) -> str:
-                        return (_row[col].strip()
-                                if _row and col < len(_row) else "")
-                    live_rcode = _lv(6)
-                    if live_rcode in ("Not Assigned", NOT_ASSIGNED, ""):
-                        live_rcode = prev_snap.get("route", "")
-                    if live_rcode in ("Not Assigned", NOT_ASSIGNED):
-                        live_rcode = ""
-                    tat_hrs  = sla_map.get(live_rcode.upper()) if live_rcode else None
-                    completed_trips.append({
-                        "RPS_Number":     rps_no,
-                        "Vehicle_Number": vno,
-                        "Vehicle_Size":   vt_sheet.get(vno, ""),
-                        "Driver_Name":    _lv(15),
-                        "Driver_Code":    _lv(16),
-                        "Route":          _lv(5),
-                        "Route_Code":     live_rcode,
-                        "Route_TAT":      tat_hrs / 24 if tat_hrs else "",
-                        "Start_Time":     _lv(7),
-                        "Given_Advance":  _lv(17),
-                        "Given_Diesel":   _lv(18),
-                        "Diesel_Amount":  _lv(19),
-                        "Given_Toll":     _lv(20),
-                        "Given_Challan":  _lv(21),
-                        "Extra_Diesel":   _lv(22),
-                        "Maintainance":   _lv(23),
-                    })
-
             # Queue routes with no SLA entry yet (master only) → operator fills hours.
             route_code = build_route_code(v, hub_map)
             if (do_side_effects and v.get("isOnTrip") and route_code
@@ -1723,19 +2022,11 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
             row_data = build_row(v, sno, lock_vals.get(vno, ""), hub_map, vt_sheet,
                                  hub_coords, prev_snap, consignee_codes,
                                  hub_coords_by_code, route_hub_names, sla_map,
-                                 vehicle_route_map)
+                                 vehicle_route_map, vehicle_id_map)
 
-            # ── Per-cell freeze (vno-indexed; survives any sort of Tracking) ─
             # New trip (new RPS) → overwrite everything. Same trip → for each
             # cell, if the Tracking value differs from what we last wrote
             # (shadow), the user edited it → preserve it; otherwise refresh.
-            trk_row    = row_num
-            shd_row    = shadow_row_of[vno]
-            live_row   = live_by_vno.get(vno)        # None if new in Tracking
-            shadow_row = shadow_by_vno.get(vno)      # None if new in shadow
-            cur_rps    = fmt(v.get("tripId")) if v.get("isOnTrip") else ""
-            shadow_rps = (shadow_row[2].strip() if shadow_row and len(shadow_row) > 2 else "")
-            new_trip   = (shadow_row is None) or (bool(cur_rps) and cur_rps != shadow_rps)
 
             for col_idx, value in enumerate(row_data):
                 if value is None:
@@ -1784,6 +2075,47 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
         last_col  = COL_LETTERS[-1]
         for vno, rnum in row_map.items():
             if vno not in valid_vnos:
+                # ── Last-chance trip copy ─────────────────────────────────────
+                # Vehicle disappeared from FMS API (trip closed / removed from
+                # dashboard) before we could copy it. If it was Reached-Unloading
+                # with a confirmed arrival, copy now before blanking the row.
+                prev_gone   = stage_snapshot.get(vno, {})
+                conf_arr    = lock_vals.get(vno, "")
+                rps_gone    = prev_gone.get("rps", "")
+                if (trip_sheet_id and not dry_run
+                        and prev_gone.get("stage") == "Reached-Unloading"
+                        and conf_arr and rps_gone):
+                    live_r = live_by_vno.get(vno)
+                    def _lv_g(col: int, _row=live_r) -> str:
+                        return (_row[col].strip() if _row and col < len(_row) else "")
+                    rc_gone = _lv_g(6)
+                    if rc_gone in ("Not Assigned", NOT_ASSIGNED, ""):
+                        rc_gone = prev_gone.get("route", "")
+                    if rc_gone in ("Not Assigned", NOT_ASSIGNED):
+                        rc_gone = ""
+                    tat_g = sla_map.get(rc_gone.upper()) if rc_gone else None
+                    print(f"  [↑ LAST-CHANCE] {vno} | RPS {rps_gone} | "
+                          f"copying to trip sheet before row is blanked", flush=True)
+                    completed_trips.append({
+                        "RPS_Number":     rps_gone,
+                        "Vehicle_Number": vno,
+                        "Vehicle_Size":   vt_sheet.get(vno, ""),
+                        "Driver_Name":    _lv_g(15),
+                        "Driver_Code":    _lv_g(16),
+                        "Route":          _lv_g(5),
+                        "Route_Code":     rc_gone,
+                        "Route_TAT":      tat_g / 24 if tat_g else "",
+                        "Start_Time":     _lv_g(7),
+                        "End_Time":       conf_arr,
+                        "Given_Advance":  _lv_g(17),
+                        "Given_Diesel":   _lv_g(18),
+                        "Diesel_Amount":  _lv_g(19),
+                        "Given_Toll":     _lv_g(20),
+                        "Given_Challan":  _lv_g(21),
+                        "Extra_Diesel":   _lv_g(22),
+                        "Maintainance":   _lv_g(23),
+                    })
+                # Now blank the row
                 tracking_updates.append({"range":  f"A{rnum}:{last_col}{rnum}",
                                          "values": [blank_row]})
                 removed += 1
@@ -1868,6 +2200,26 @@ def run_once(dry_run: bool = False):
         ss, ws, vehicles, shared, dry_run=dry_run,
         do_side_effects=True, remove_strangers=False)
 
+    # ── Console summary: vehicles at Reached-Unloading this cycle ────────────
+    reached_vehicles = [
+        v for v in vehicles
+        if master_stage_map.get((v.get("vehicleNumber") or "").strip())
+        == "Reached-Unloading"
+    ]
+    if reached_vehicles:
+        print(f"\n  ╔═ REACHED THIS CYCLE ({len(reached_vehicles)} vehicle(s)) ════════════════════",
+              flush=True)
+        for rv in reached_vehicles:
+            rvno = (rv.get("vehicleNumber") or "").strip()
+            rps  = (fmt(rv.get("tripId")) if rv.get("isOnTrip")
+                    else master_snapshot.get(rvno, {}).get("rps", ""))
+            dest = (rv.get("consigneeName") or "").split(";")[-1].strip()
+            print(f"  ║  {rvno:15s} | RPS {rps or 'unknown':12s} | Dest: {dest}",
+                  flush=True)
+        print(f"  ╚{'═' * 55}", flush=True)
+    else:
+        print("\n  [REACHED] No vehicles at final destination this cycle.", flush=True)
+
     # ── Hub mirrors: each gets ONLY its hub's vehicles (Tracking tab) ────────
     vehicle_hub = shared["vehicle_hub"]
     for hub_name, (sheet_id, tab) in HUB_TRACKING_SHEETS.items():
@@ -1877,9 +2229,24 @@ def run_once(dry_run: bool = False):
         print(f"\n  → Hub '{hub_name}': {len(subset)} vehicle(s)", flush=True)
         try:
             hub_ss, hub_ws = connect(sheet_id, tab)
+            trip_sid = HUB_TRIP_SHEETS.get(hub_name) or None
+            # Step 1: copy reached rows from sheet BEFORE write_tracking blanks them
+            if trip_sid and not dry_run:
+                try:
+                    n = sync_reached_to_trip_sheet(
+                        hub_ws, trip_sid,
+                        shared["sla_map"], shared["vt_map"],
+                        dry_run=False,
+                    )
+                    if n:
+                        print(f"  [Trip Sync] {n} reached row(s) copied to trip sheet", flush=True)
+                except Exception as exc:
+                    print(f"  [WARN] Trip sync error: {exc}", flush=True)
+                    traceback.print_exc()
+            # Step 2: update the tracking sheet (trip copy already handled above)
             write_tracking(hub_ss, hub_ws, subset, shared, dry_run=dry_run,
                            do_side_effects=False, remove_strangers=True,
-                           trip_sheet_id=HUB_TRIP_SHEETS.get(hub_name) or None)
+                           trip_sheet_id=None)
         except Exception as exc:
             # One bad hub sheet must not break the master or the other hubs.
             print(f"  [ERROR] Hub '{hub_name}' update failed: {exc}", flush=True)
