@@ -3,7 +3,7 @@ name: FMS Tracking
 on:
   schedule:
     # Changed to 15 minutes as GitHub handles it slightly better than 10
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
