@@ -44,10 +44,9 @@ HUB_TRACKING_SHEETS = {
     "Ambala Local": ("1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ", "Tracking"),
 }
 
-# Per-hub trip (MIS) sheets — completed trip log, tab per month
-HUB_TRIP_SHEETS = {
-    "Ambala": "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo",
-}
+# Per-hub trip (MIS) sheets are intentionally disabled in this version.
+# This script only maintains Tracking + hub mirror sheets.
+HUB_TRIP_SHEETS = {}
 
 # RPS Report API — plain HTTP, requires X-Requested-With header
 RPS_REPORT_URL = (
@@ -1555,116 +1554,10 @@ def _write_trip_row(ss, ws: gspread.Worksheet, r: int, data: dict):
     ss.batch_update({"requests": fmt_reqs})
 
 
-def _write_completed_trip(trip_ss, tab_name: str, trip_data: dict):
-    """
-    Append a completed trip to the MIS tab (one row per RPS). Silently skips
-    duplicates. End_Time must already be set in trip_data by the caller
-    (it comes from the locked Route_Reaching_Date_Time in the Tracking sheet).
-    """
-    rps_no = trip_data.get("RPS_Number", "")
-    if not rps_no:
-        return
-    ws = _get_or_create_trip_tab(trip_ss, tab_name)
-    if rps_no in ws.col_values(1):
-        return   # already logged — dedup
-    # End_Time is the GPS-confirmed Route_Reaching_Date_Time passed by caller.
-    # No need to re-query the RPS API; that time is already accurate.
-    row_num = len(ws.col_values(1)) + 1
-    _write_trip_row(trip_ss, ws, row_num, trip_data)
-    end_str = trip_data.get("End_Time", "") or "(pending)"
-    print(f"  [✓ Trip→{tab_name}] RPS {rps_no} | {trip_data.get('Vehicle_Number','')} "
-          f"| Arrival: {end_str}", flush=True)
-
-
 def sync_reached_to_trip_sheet(hub_ws, trip_sheet_id,
                                 sla_map, vt_sheet, dry_run=False):
-    """
-    Read hub Tracking sheet directly. Copy every row where
-      Current_Stage == "Reached-Unloading" AND
-      Route_Reaching_Date_Time is filled AND
-      RPS_No is filled
-    to the correct monthly MIS tab in the trip sheet.
-    Skips RPS numbers already present (dedup via col-A check).
-    Returns count of rows newly written.
-    """
-    if not trip_sheet_id or dry_run:
-        return 0
-
-    all_rows = hub_ws.get_all_values()
-    if len(all_rows) < 2:
-        return 0
-
-    header = [h.strip() for h in all_rows[0]]
-
-    def ci(name, default):
-        try:
-            return header.index(name)
-        except ValueError:
-            return default
-
-    ci_stage   = ci("Current_Stage",            10)
-    ci_arrival = ci("Route_Reaching_Date_Time",   8)
-    ci_rps     = ci("RPS_No",                     2)
-    ci_vno     = ci("Vehicle_No",                 3)
-    ci_route   = ci("Route",                      5)
-    ci_rcode   = ci("Route_Code",                 6)
-    ci_start   = ci("Route_Start_Date_Time",       7)
-    ci_driver  = ci("Driver_Name",               15)
-    ci_dcode   = ci("Driver_Code",               16)
-    ci_adv     = ci("Given_Advance",             17)
-    ci_diesel  = ci("Given_Diesel",              18)
-    ci_damt    = ci("Diesel_Amount",             19)
-    ci_toll    = ci("Given_Toll",                20)
-    ci_challan = ci("Given_Challan",             21)
-    ci_xdsl    = ci("Extra_Diesel",              22)
-    ci_maint   = ci("Maintainance",              23)
-
-    def cell(row, idx):
-        return row[idx].strip() if idx < len(row) else ""
-
-    trip_ss = _gspread_client().open_by_key(trip_sheet_id)
-    copied  = 0
-
-    for row in all_rows[1:]:
-        stage   = cell(row, ci_stage)
-        arrival = cell(row, ci_arrival)
-        rps     = cell(row, ci_rps)
-
-        if stage != "Reached-Unloading" or not arrival or not rps:
-            continue
-
-        vno     = cell(row, ci_vno)
-        start   = cell(row, ci_start)
-        rcode   = cell(row, ci_rcode)
-        tat_hrs = sla_map.get(rcode.upper()) if rcode else None
-
-        start_dt = _parse_since_dt(start)
-        tab_name = (start_dt.strftime("%B_%Y_MIS") if start_dt
-                    else datetime.now().strftime("%B_%Y_MIS"))
-
-        trip_data = {
-            "RPS_Number":     rps,
-            "Vehicle_Number": vno,
-            "Vehicle_Size":   vt_sheet.get(vno, ""),
-            "Driver_Name":    cell(row, ci_driver),
-            "Driver_Code":    cell(row, ci_dcode),
-            "Route":          cell(row, ci_route),
-            "Route_Code":     rcode,
-            "Route_TAT":      tat_hrs / 24 if tat_hrs else "",
-            "Start_Time":     start,
-            "End_Time":       arrival,
-            "Given_Advance":  cell(row, ci_adv),
-            "Given_Diesel":   cell(row, ci_diesel),
-            "Diesel_Amount":  cell(row, ci_damt),
-            "Given_Toll":     cell(row, ci_toll),
-            "Given_Challan":  cell(row, ci_challan),
-            "Extra_Diesel":   cell(row, ci_xdsl),
-            "Maintainance":   cell(row, ci_maint),
-        }
-        _write_completed_trip(trip_ss, tab_name, trip_data)
-        copied += 1
-
-    return copied
+    """Disabled: this script no longer writes completed trips to MIS tabs."""
+    return 0
 
 
 # ── Main update ────────────────────────────────────────────────────────────────
@@ -1822,8 +1715,7 @@ def load_shared(ss, vehicles: list[dict]) -> dict:
 
 def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict,
                    dry_run: bool = False, do_side_effects: bool = False,
-                   remove_strangers: bool = False,
-                   trip_sheet_id: str | None = None):
+                   remove_strangers: bool = False):
     """
     Write the Tracking tab for one spreadsheet from `vehicles` (already filtered
     to the right subset) using the `shared` lookups.
@@ -1900,7 +1792,6 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
     missing_coord_hubs: dict[str, str] = {}
     missing_sla:    dict = {}    # route_code → True, pending operator SLA hours
     edits_kept = 0
-    completed_trips: list = []   # trips to log to MIS sheet this cycle
 
     def _cell_color(sheet_id: int, row_num: int, col_idx: int, bg: dict) -> dict:
         return {"repeatCell": {
@@ -1945,61 +1836,12 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
             shadow_rps = (shadow_row[2].strip() if shadow_row and len(shadow_row) > 2 else "")
             new_trip   = (shadow_row is None) or (bool(cur_rps) and cur_rps != shadow_rps)
 
-            # ── Completed trip detection ──────────────────────────────────────
-            # confirmed_arrival = Route_Reaching_Date_Time already in the sheet
-            # (lock_vals holds what was there before this cycle's writes).
-            # rps_no_snap = the RPS from the snapshot (prev cycle).
-            confirmed_arrival = lock_vals.get(vno, "")
-            rps_no_snap       = prev_snap.get("rps", "")
-
             # Console: log first-time arrival (stage just flipped to Reached-Unloading)
             prev_stage = prev_snap.get("stage", "")
             if stage == "Reached-Unloading" and prev_stage != "Reached-Unloading":
-                arrival_label = confirmed_arrival or "(arrival time → next cycle)"
-                print(f"  [▶ REACHED] {vno} | RPS {rps_no_snap or 'unknown'} "
+                arrival_label = lock_vals.get(vno, "") or "(arrival time → next cycle)"
+                print(f"  [▶ REACHED] {vno} | RPS {prev_snap.get('rps', '') or 'unknown'} "
                       f"| Arrival: {arrival_label}", flush=True)
-
-            # Copy to trip sheet when:
-            #   A) Stage is still Reached-Unloading AND arrival confirmed, OR
-            #   B) Stage just left Reached-Unloading (LAST CHANCE before arrival
-            #      gets wiped this cycle) — catches the FMS trip-close cycle.
-            # Dedup inside _write_completed_trip prevents double rows per RPS.
-            should_copy = (
-                trip_sheet_id and not dry_run
-                and confirmed_arrival
-                and rps_no_snap
-                and (stage == "Reached-Unloading"          # still at dest
-                     or prev_stage == "Reached-Unloading") # just left dest
-            )
-            if should_copy:
-                def _lv(col: int, _row=live_row) -> str:
-                    return (_row[col].strip()
-                            if _row and col < len(_row) else "")
-                live_rcode = _lv(6)
-                if live_rcode in ("Not Assigned", NOT_ASSIGNED, ""):
-                    live_rcode = prev_snap.get("route", "")
-                if live_rcode in ("Not Assigned", NOT_ASSIGNED):
-                    live_rcode = ""
-                tat_hrs = sla_map.get(live_rcode.upper()) if live_rcode else None
-                completed_trips.append({
-                    "RPS_Number":     rps_no_snap,
-                    "Vehicle_Number": vno,
-                    "Vehicle_Size":   vt_sheet.get(vno, ""),
-                    "Driver_Name":    _lv(15),
-                    "Driver_Code":    _lv(16),
-                    "Route":          _lv(5),
-                    "Route_Code":     live_rcode,
-                    "Route_TAT":      tat_hrs / 24 if tat_hrs else "",
-                    "Start_Time":     _lv(7),
-                    "End_Time":       confirmed_arrival,   # GPS-confirmed arrival
-                    "Given_Advance":  _lv(17),
-                    "Given_Diesel":   _lv(18),
-                    "Diesel_Amount":  _lv(19),
-                    "Given_Toll":     _lv(20),
-                    "Given_Challan":  _lv(21),
-                    "Extra_Diesel":   _lv(22),
-                    "Maintainance":   _lv(23),
-                })
 
             # Queue planned hubs missing coords for manual entry (master only).
             if do_side_effects and v.get("isOnTrip"):
@@ -2075,46 +1917,6 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
         last_col  = COL_LETTERS[-1]
         for vno, rnum in row_map.items():
             if vno not in valid_vnos:
-                # ── Last-chance trip copy ─────────────────────────────────────
-                # Vehicle disappeared from FMS API (trip closed / removed from
-                # dashboard) before we could copy it. If it was Reached-Unloading
-                # with a confirmed arrival, copy now before blanking the row.
-                prev_gone   = stage_snapshot.get(vno, {})
-                conf_arr    = lock_vals.get(vno, "")
-                rps_gone    = prev_gone.get("rps", "")
-                if (trip_sheet_id and not dry_run
-                        and prev_gone.get("stage") == "Reached-Unloading"
-                        and conf_arr and rps_gone):
-                    live_r = live_by_vno.get(vno)
-                    def _lv_g(col: int, _row=live_r) -> str:
-                        return (_row[col].strip() if _row and col < len(_row) else "")
-                    rc_gone = _lv_g(6)
-                    if rc_gone in ("Not Assigned", NOT_ASSIGNED, ""):
-                        rc_gone = prev_gone.get("route", "")
-                    if rc_gone in ("Not Assigned", NOT_ASSIGNED):
-                        rc_gone = ""
-                    tat_g = sla_map.get(rc_gone.upper()) if rc_gone else None
-                    print(f"  [↑ LAST-CHANCE] {vno} | RPS {rps_gone} | "
-                          f"copying to trip sheet before row is blanked", flush=True)
-                    completed_trips.append({
-                        "RPS_Number":     rps_gone,
-                        "Vehicle_Number": vno,
-                        "Vehicle_Size":   vt_sheet.get(vno, ""),
-                        "Driver_Name":    _lv_g(15),
-                        "Driver_Code":    _lv_g(16),
-                        "Route":          _lv_g(5),
-                        "Route_Code":     rc_gone,
-                        "Route_TAT":      tat_g / 24 if tat_g else "",
-                        "Start_Time":     _lv_g(7),
-                        "End_Time":       conf_arr,
-                        "Given_Advance":  _lv_g(17),
-                        "Given_Diesel":   _lv_g(18),
-                        "Diesel_Amount":  _lv_g(19),
-                        "Given_Toll":     _lv_g(20),
-                        "Given_Challan":  _lv_g(21),
-                        "Extra_Diesel":   _lv_g(22),
-                        "Maintainance":   _lv_g(23),
-                    })
                 # Now blank the row
                 tracking_updates.append({"range":  f"A{rnum}:{last_col}{rnum}",
                                          "values": [blank_row]})
@@ -2170,19 +1972,6 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
           f"{f' | {removed} removed' if removed else ''}"
           f"{f' | {edits_kept} edits kept' if edits_kept else ''}", flush=True)
 
-    # ── Write completed trips to MIS sheet (hub sheets only) ─────────────────
-    if completed_trips and trip_sheet_id:
-        try:
-            trip_ss = _gspread_client().open_by_key(trip_sheet_id)
-            for trip in completed_trips:
-                start_dt = _parse_since_dt(trip.get("Start_Time", ""))
-                tab_name = (start_dt.strftime("%B_%Y_MIS") if start_dt
-                            else datetime.now().strftime("%B_%Y_MIS"))
-                _write_completed_trip(trip_ss, tab_name, trip)
-        except Exception as exc:
-            print(f"  [WARN] Trip sheet write failed: {exc}", flush=True)
-            traceback.print_exc()
-
     return stage_snapshot, stage_map
 
 
@@ -2229,24 +2018,8 @@ def run_once(dry_run: bool = False):
         print(f"\n  → Hub '{hub_name}': {len(subset)} vehicle(s)", flush=True)
         try:
             hub_ss, hub_ws = connect(sheet_id, tab)
-            trip_sid = HUB_TRIP_SHEETS.get(hub_name) or None
-            # Step 1: copy reached rows from sheet BEFORE write_tracking blanks them
-            if trip_sid and not dry_run:
-                try:
-                    n = sync_reached_to_trip_sheet(
-                        hub_ws, trip_sid,
-                        shared["sla_map"], shared["vt_map"],
-                        dry_run=False,
-                    )
-                    if n:
-                        print(f"  [Trip Sync] {n} reached row(s) copied to trip sheet", flush=True)
-                except Exception as exc:
-                    print(f"  [WARN] Trip sync error: {exc}", flush=True)
-                    traceback.print_exc()
-            # Step 2: update the tracking sheet (trip copy already handled above)
             write_tracking(hub_ss, hub_ws, subset, shared, dry_run=dry_run,
-                           do_side_effects=False, remove_strangers=True,
-                           trip_sheet_id=None)
+                           do_side_effects=False, remove_strangers=True)
         except Exception as exc:
             # One bad hub sheet must not break the master or the other hubs.
             print(f"  [ERROR] Hub '{hub_name}' update failed: {exc}", flush=True)
