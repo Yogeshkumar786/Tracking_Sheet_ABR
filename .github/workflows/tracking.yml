@@ -2,23 +2,24 @@ name: FMS Tracking
 
 on:
   schedule:
-    # Changed to 15 minutes as GitHub handles it slightly better than 10
-    - cron: '*/5 * * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
   track:
     runs-on: ubuntu-latest
     timeout-minutes: 8
-    env:                       # ← add this
-      TZ: Asia/Kolkata         # ← IST for all datetime.now() calls
+    env:
+      TZ: Asia/Kolkata
     concurrency:
       group: fms-tracking
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with:
+          python-version: '3.11'
+          cache: 'pip'
       - run: pip install -r requirements.txt
       - run: printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
         env:
