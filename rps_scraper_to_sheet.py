@@ -30,6 +30,7 @@ Tracking tab.
 """
 from __future__ import annotations
 import argparse
+import re
 import sys
 import warnings
 from datetime import datetime, timedelta
@@ -38,9 +39,9 @@ warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # Reuse everything from the main tracker. Source of truth lives there.
+import fms_to_sheets as fms
 from fms_to_sheets import (
     connect,
-    fetch_all_completed_trips,
     get_or_create_tab,
     HUB_LOCATIONS_HEADERS, HUB_LOCATIONS_TAB,
     load_hub_coords_tab,
@@ -62,6 +63,54 @@ def _parse_dt_arg(s: str, name: str) -> datetime:
     raise argparse.ArgumentTypeError(
         f"--{name}: '{s}' is not YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'"
     )
+
+
+def _extract_hub_code(name: str, hub_map: dict[str, str]) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"\(([^()]+)\)", text)
+    if m:
+        return m.group(1).strip().upper()
+    key = text.upper()
+    norm = re.sub(r"\([^)]*\)", "", text).strip().upper()
+    return str(hub_map.get(key) or hub_map.get(norm) or "").strip().upper()
+
+
+def _derive_route_code_from_route(route_name: str, hub_map: dict[str, str]) -> str:
+    route = str(route_name or "").strip()
+    if not route:
+        return ""
+    parts = [p.strip() for p in route.split("/") if p.strip()]
+    if not parts:
+        return ""
+    origin = _extract_hub_code(parts[0], hub_map)
+    dest = _extract_hub_code(parts[-1], hub_map)
+    if origin and dest:
+        return f"{origin}-{dest}"
+    return dest or origin
+
+
+def _patch_route_code_fix(hub_map: dict[str, str]) -> None:
+    original_fetch = fms.fetch_all_completed_trips
+
+    def wrapped_fetch(vehicle_numbers, from_dt, to_dt, _hub_map):
+        trips = original_fetch(vehicle_numbers, from_dt, to_dt, _hub_map)
+        fixed = 0
+        for trip in trips:
+            route = str(trip.get("Route") or "").strip()
+            route_code = str(trip.get("Route_Code") or "").strip()
+            if route_code and route_code != route and "/" not in route_code:
+                continue
+            derived = _derive_route_code_from_route(route, hub_map)
+            if derived:
+                trip["Route_Code"] = derived
+                fixed += 1
+        if fixed:
+            print(f"  [rps_scraper] Route_Code normalized for {fixed} trip row(s)", flush=True)
+        return trips
+
+    fms.fetch_all_completed_trips = wrapped_fetch
 
 
 def main():
@@ -114,6 +163,9 @@ def main():
     print(f"  Vehicles tab:  {len(vehicle_hub)} vehicle→hub mappings", flush=True)
     print(f"  Route SLA:     {len(sla_map)} route(s) with TAT hours", flush=True)
     print(f"  Route Codes:   {len(hub_map)} hub-name→code mappings", flush=True)
+
+    # Keep this fix local to rps_scraper_to_sheet.py without editing fms_to_sheets.py
+    _patch_route_code_fix(hub_map)
 
     # ── Dispatch to the shared safety-net writer ─────────────────────────────
     print("\n[rps_scraper] Calling RPS Report API…", flush=True)
