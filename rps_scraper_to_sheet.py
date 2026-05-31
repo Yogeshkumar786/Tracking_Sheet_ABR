@@ -52,7 +52,7 @@ ROUTE_SLA_TAB   = "Route SLA"
 # hub_name MUST match values in the master Vehicles tab "Vehicle Hub" column.
 HUB_TRIP_SHEETS: dict[str, str] = {
     # "Ambala":       "PUT_AMBALA_MIS_SHEET_ID_HERE",
-    # "Ambala Local": "PUT_AMBALA_LOCAL_MIS_SHEET_ID_HERE",
+    "Ambala Local": "1SeJ06RjF2ONqCsP53_NO0FEjKhY3EV5UrNtLMmsA2N4",
     # Example single destination from earlier conversation:
     "Ambala": "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo"
 }
