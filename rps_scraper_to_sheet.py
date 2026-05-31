@@ -578,7 +578,14 @@ def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
 
 
 def format_new_rows(ss, ws, start_row: int, count: int):
-    """Apply date format to I/J and [h]:mm to H/K/M/N for the just-written rows."""
+    """Apply date format to I/J, [h]:mm to H/K/M/N, and the BOOLEAN/checkbox
+    data-validation rule to Close_Status (W) for the just-written rows.
+
+    The checkbox rule MUST be re-applied on every write — the tab-creation
+    rule covers rows 1–2000 only and is absent on legacy tabs, so the
+    raw `False` value would otherwise render as plain text instead of an
+    unchecked checkbox.
+    """
     reqs = []
     # Date format on Start_Time (I=8 zero-based) and End_Time (J=9)
     for ci in (8, 9):
@@ -606,6 +613,15 @@ def format_new_rows(ss, ws, start_row: int, count: int):
             }},
             "fields": "userEnteredFormat.numberFormat",
         }})
+    # Checkbox validation on Close_Status (W = last column)
+    reqs.append({"setDataValidation": {
+        "range": {"sheetId": ws.id,
+                  "startRowIndex": start_row - 1,
+                  "endRowIndex":   start_row - 1 + count,
+                  "startColumnIndex": TRIP_NCOLS - 1,
+                  "endColumnIndex":   TRIP_NCOLS},
+        "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
+    }})
     if reqs:
         ss.batch_update({"requests": reqs})
 
