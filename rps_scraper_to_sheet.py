@@ -452,38 +452,48 @@ def _normalize_rps(v) -> str:
     return s
 
 
-def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int]]]:
+def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int, bool, bool]]]:
     """Scan every *_MIS tab and return:
-        complete  : {normalized_rps}                   — RPS rows with End_Time set
-        missing_end: {normalized_rps: (tab_name, row)} — RPS rows with End_Time blank
+        all_rps  : {normalized_rps}
+            — every RPS number already in this workbook (for dedup).
+              No new row will be inserted for these.
+        backfill : {normalized_rps: (tab_name, row, need_start, need_end)}
+            — rows missing Start_Time and/or End_Time that should be
+              updated on the next run.  need_start / need_end are True
+              when the corresponding cell is blank.  Both fields are
+              tracked and filled INDEPENDENTLY of each other.
 
-    A row whose End_Time (col J) is empty is eligible for a back-fill on the
-    next run. A row whose End_Time is already filled is fully deduplicated.
     Uses UNFORMATTED_VALUE so number-formatted RPS cells (7,965,359 /
     scientific notation) round-trip correctly.
     """
-    complete: set[str] = set()
-    missing_end: dict[str, tuple[str, int]] = {}
+    all_rps:  set[str] = set()
+    backfill: dict[str, tuple[str, int, bool, bool]] = {}
     for ws in ss.worksheets():
         if not ws.title.endswith("_MIS"):
             continue
-        rows_ab_j: list = []          # parallel rows of [A, J] starting at sheet row 2
+        rows_data: list = []   # (rps, start, end) tuples starting at sheet row 2
         try:
             resp = ss.values_get(
                 f"'{ws.title}'!A2:J",
                 params={"valueRenderOption": "UNFORMATTED_VALUE"},
             )
             for row in resp.get("values", []):
-                rps_cell = row[0] if len(row) > 0 else ""
-                end_cell = row[9] if len(row) > 9 else ""
-                rows_ab_j.append((rps_cell, end_cell))
+                rps_cell   = row[0] if len(row) > 0 else ""
+                start_cell = row[8] if len(row) > 8 else ""   # col I
+                end_cell   = row[9] if len(row) > 9 else ""   # col J
+                rows_data.append((rps_cell, start_cell, end_cell))
         except Exception as exc:
             print(f"  [dedup] {ws.title}: values_get failed ({exc}), "
                   f"falling back to col_values", flush=True)
             try:
-                a = ws.col_values(1)[1:]
-                j = ws.col_values(10)[1:]
-                rows_ab_j = list(zip(a, j + [""] * (len(a) - len(j))))
+                a     = ws.col_values(1)[1:]
+                i_col = ws.col_values(9)[1:]   # col I = Start_Time
+                j     = ws.col_values(10)[1:]  # col J = End_Time
+                rows_data = list(zip(
+                    a,
+                    i_col + [""] * max(0, len(a) - len(i_col)),
+                    j     + [""] * max(0, len(a) - len(j)),
+                ))
             except Exception as exc2:
                 print(f"  [dedup] {ws.title}: col_values failed ({exc2})",
                       flush=True)
@@ -491,25 +501,32 @@ def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int]]]:
 
         loaded = 0
         backfill_candidates = 0
-        for i, (rps_cell, end_cell) in enumerate(rows_ab_j, start=2):
+        for i, (rps_cell, start_cell, end_cell) in enumerate(rows_data, start=2):
             key = _normalize_rps(rps_cell)
             if not key:
                 continue
             loaded += 1
-            end_str = str(end_cell or "").strip() if end_cell is not None else ""
-            if end_str:
-                complete.add(key)
-                # Wins over a stray earlier missing-end entry (rare dup case)
-                missing_end.pop(key, None)
-            else:
-                if key not in complete and key not in missing_end:
-                    missing_end[key] = (ws.title, i)
+            end_str   = str(end_cell   or "").strip() if end_cell   is not None else ""
+            start_str = str(start_cell or "").strip() if start_cell is not None else ""
+            all_rps.add(key)
+            need_start = not bool(start_str)
+            need_end   = not bool(end_str)
+            if need_start or need_end:
+                if key not in backfill:
+                    backfill[key] = (ws.title, i, need_start, need_end)
                     backfill_candidates += 1
+            else:
+                # Row is fully complete — remove stale backfill entry if any.
+                backfill.pop(key, None)
+        bf_start = sum(1 for _, _, ns, _ in backfill.values() if ns)
+        bf_end   = sum(1 for _, _, _, ne in backfill.values() if ne)
         print(f"  [dedup] {ws.title}: {loaded} RPS row(s); "
-              f"{backfill_candidates} missing End_Time", flush=True)
-    print(f"  [dedup] Workbook totals: {len(complete)} complete, "
-          f"{len(missing_end)} awaiting End_Time", flush=True)
-    return complete, missing_end
+              f"{backfill_candidates} needing backfill", flush=True)
+    print(f"  [dedup] Workbook totals: {len(all_rps)} known RPS, "
+          f"{len(backfill)} awaiting backfill "
+          f"(start={sum(1 for _,_,ns,_ in backfill.values() if ns)}, "
+          f"end={sum(1 for _,_,_,ne in backfill.values() if ne)})", flush=True)
+    return all_rps, backfill
 
 
 def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
@@ -752,10 +769,10 @@ def main():
     total_unrouted    = 0
     total_endfilled   = 0
 
-    # Cache per workbook: (spreadsheet, complete_set, missing_end_map).
+    # Cache per workbook: (spreadsheet, all_rps_set, backfill_map).
     workbook_cache: dict[str, tuple[gspread.Spreadsheet,
                                     set[str],
-                                    dict[str, tuple[str, int]]]] = {}
+                                    dict[str, tuple[str, int, bool, bool]]]] = {}
 
     # Group records by destination workbook + tab.
     # Key: (hub_name, tab_name)
@@ -783,46 +800,58 @@ def main():
         sheet_id = HUB_TRIP_SHEETS[hub]
         if sheet_id not in workbook_cache:
             ss = client.open_by_key(sheet_id)
-            complete, missing_end = existing_rps_in_workbook(ss)
-            workbook_cache[sheet_id] = (ss, complete, missing_end)
-        ss, existing, missing_end = workbook_cache[sheet_id]
+            all_rps, backfill = existing_rps_in_workbook(ss)
+            workbook_cache[sheet_id] = (ss, all_rps, backfill)
+        ss, existing, backfill = workbook_cache[sheet_id]
 
-        # Classify each API record into one of three buckets:
-        #   - already complete (RPS present with End_Time) → skip
-        #   - awaiting End_Time → queue an End_Time-only update
-        #   - new RPS → append as a full row
+        # Classify each API record:
+        #   - not in existing  → new RPS, append as a full row
+        #   - in existing + in backfill → queue Start_Time/End_Time updates
+        #                                  independently (each field is filled
+        #                                  only when it is blank AND the API
+        #                                  has a value for it)
+        #   - in existing, nothing missing → skip
         fresh: list[dict] = []
-        end_updates: list[dict] = []   # [{range, value}]
+        end_updates: list[dict] = []   # [{tab, row, end_value, start_value}]
         for rec in recs:
             rps = first(rec, F_RPS)
             if not rps:
                 continue
             key = _normalize_rps(rps)
             if key in existing:
-                total_skipped += 1
-                continue
-            if key in missing_end:
-                # Try to backfill End_Time on the existing row.
-                end_raw = first(rec, F_END)
-                end_dt  = parse_dt(end_raw)
-                if not end_raw or not end_dt:
-                    total_skipped += 1  # still no End_Time → nothing to do
-                    continue
-                tab_title, row_num = missing_end[key]
-                end_cell = end_dt.strftime("%d/%m/%Y %H:%M:%S")
-                end_updates.append({
-                    "tab":   tab_title,
-                    "row":   row_num,
-                    "value": end_cell,
-                })
-                # Promote to complete so we never touch it again this run.
-                existing.add(key)
-                missing_end.pop(key, None)
+                # Row already exists — check independent fields.
+                if key in backfill:
+                    tab_title, row_num, need_start, need_end = backfill[key]
+                    end_val   = None
+                    start_val = None
+                    if need_end:
+                        end_raw = first(rec, F_END)
+                        end_dt  = parse_dt(end_raw)
+                        if end_dt:
+                            end_val = end_dt.strftime("%d/%m/%Y %H:%M:%S")
+                    if need_start:
+                        start_raw = first(rec, F_START)
+                        start_dt  = parse_dt(start_raw)
+                        if start_dt:
+                            start_val = start_dt.strftime("%d/%m/%Y %H:%M:%S")
+                    if end_val or start_val:
+                        end_updates.append({
+                            "tab":         tab_title,
+                            "row":         row_num,
+                            "end_value":   end_val,    # None → don't touch col J
+                            "start_value": start_val,  # None → don't touch col I
+                        })
+                        backfill.pop(key, None)  # won't touch again this run
+                    else:
+                        total_skipped += 1  # API still has no data for missing fields
+                else:
+                    total_skipped += 1
                 continue
             existing.add(key)            # de-dupe within this batch too
             fresh.append(rec)
 
-        # Apply End_Time back-fills first (grouped by tab to batch by sheet).
+        # Apply Start_Time / End_Time back-fills independently.
+        # Grouped by tab so each sheet gets one batch_update call.
         if end_updates and not args.dry_run:
             by_tab: dict[str, list[dict]] = {}
             for u in end_updates:
@@ -832,30 +861,70 @@ def main():
                     target_ws = ss.worksheet(tab_title)
                 except gspread.WorksheetNotFound:
                     continue
-                batch = [{"range": f"J{u['row']}", "values": [[u["value"]]]}
-                         for u in ups]
-                target_ws.batch_update(batch,
-                                       value_input_option="USER_ENTERED")
-                # Re-apply date format on the updated cells.
-                fmt_reqs = [{"repeatCell": {
-                    "range": {"sheetId": target_ws.id,
-                              "startRowIndex": u["row"] - 1,
-                              "endRowIndex":   u["row"],
-                              "startColumnIndex": 9, "endColumnIndex": 10},
-                    "cell": {"userEnteredFormat": {
-                        "numberFormat": {"type": "DATE_TIME",
-                                         "pattern": "dd/MM/yyyy HH:mm:ss"},
-                    }},
-                    "fields": "userEnteredFormat.numberFormat",
-                }} for u in ups]
-                ss.batch_update({"requests": fmt_reqs})
-                print(f"  [{hub}/{tab_title}] back-filled End_Time on "
-                      f"{len(ups)} row(s)", flush=True)
+                # Write only the cells that are actually missing.
+                batch: list[dict] = []
+                for u in ups:
+                    if u.get("end_value"):
+                        batch.append({"range": f"J{u['row']}",
+                                      "values": [[u["end_value"]]]})
+                    if u.get("start_value"):
+                        batch.append({"range": f"I{u['row']}",
+                                      "values": [[u["start_value"]]]})
+                if batch:
+                    target_ws.batch_update(batch,
+                                           value_input_option="USER_ENTERED")
+                # Re-apply dd/MM/yyyy HH:mm:ss format on every written cell.
+                fmt_reqs: list[dict] = []
+                for u in ups:
+                    if u.get("end_value"):
+                        fmt_reqs.append({"repeatCell": {
+                            "range": {"sheetId": target_ws.id,
+                                      "startRowIndex": u["row"] - 1,
+                                      "endRowIndex":   u["row"],
+                                      "startColumnIndex": 9, "endColumnIndex": 10},
+                            "cell": {"userEnteredFormat": {
+                                "numberFormat": {"type": "DATE_TIME",
+                                                 "pattern": "dd/MM/yyyy HH:mm:ss"},
+                            }},
+                            "fields": "userEnteredFormat.numberFormat",
+                        }})
+                    if u.get("start_value"):
+                        fmt_reqs.append({"repeatCell": {
+                            "range": {"sheetId": target_ws.id,
+                                      "startRowIndex": u["row"] - 1,
+                                      "endRowIndex":   u["row"],
+                                      "startColumnIndex": 8, "endColumnIndex": 9},
+                            "cell": {"userEnteredFormat": {
+                                "numberFormat": {"type": "DATE_TIME",
+                                                 "pattern": "dd/MM/yyyy HH:mm:ss"},
+                            }},
+                            "fields": "userEnteredFormat.numberFormat",
+                        }})
+                if fmt_reqs:
+                    ss.batch_update({"requests": fmt_reqs})
+                end_filled   = sum(1 for u in ups if u.get("end_value"))
+                start_filled = sum(1 for u in ups if u.get("start_value"))
+                parts = []
+                if end_filled:
+                    parts.append(f"End_Time on {end_filled} row(s)")
+                if start_filled:
+                    parts.append(f"Start_Time on {start_filled} row(s)")
+                if parts:
+                    print(f"  [{hub}/{tab_title}] back-filled "
+                          + ", ".join(parts), flush=True)
             total_endfilled += len(end_updates)
         elif end_updates and args.dry_run:
             total_endfilled += len(end_updates)
-            print(f"  [{hub}/{tab_name}] would back-fill End_Time on "
-                  f"{len(end_updates)} existing row(s)", flush=True)
+            end_would   = sum(1 for u in end_updates if u.get("end_value"))
+            start_would = sum(1 for u in end_updates if u.get("start_value"))
+            parts = []
+            if end_would:
+                parts.append(f"End_Time on {end_would} row(s)")
+            if start_would:
+                parts.append(f"Start_Time on {start_would} row(s)")
+            if parts:
+                print(f"  [{hub}/{tab_name}] would back-fill "
+                      + ", ".join(parts), flush=True)
 
         if not fresh:
             if not end_updates:
