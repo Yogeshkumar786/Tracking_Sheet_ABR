@@ -16,12 +16,14 @@ USAGE
 -----
   python rps_scraper_to_sheet.py                       # last 10 days
   python rps_scraper_to_sheet.py --days 30
+  python rps_scraper_to_sheet.py --month 2026-05       # full month (May 2026)
   python rps_scraper_to_sheet.py --from 2026-04-01 --to 2026-04-30
   python rps_scraper_to_sheet.py --dry-run
 """
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -53,7 +55,7 @@ ROUTE_SLA_TAB   = "Route SLA"
 HUB_TRIP_SHEETS: dict[str, str] = {
     # "Ambala":       "PUT_AMBALA_MIS_SHEET_ID_HERE",
     "Ambala Local": "1SeJ06RjF2ONqCsP53_NO0FEjKhY3EV5UrNtLMmsA2N4",
-    # Example single destination from earlier conversation:
+    # # Example single destination from earlier conversation:
     "Ambala": "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo"
 }
 
@@ -147,6 +149,27 @@ def parse_dt(s: str) -> datetime | None:
         except ValueError:
             pass
     return None
+
+
+# Google Sheets / Excel date serial helpers.
+# Sheets counts days from 30-Dec-1899 (Dec 30, 1899 = 0) and inherits
+# Lotus-1-2-3's fictitious Feb-29-1900, which shifts every post-Feb-1900
+# date up by 1.  Using Dec 30, 1899 as epoch already bakes that +1 in.
+_SHEETS_EPOCH = datetime(1899, 12, 30)
+
+def to_sheets_serial(dt: datetime) -> float:
+    """Convert a datetime to a Google Sheets date serial number.
+
+    Writing the result as a RAW numeric value and then applying the
+    'dd/MM/yyyy HH:mm:ss' number format guarantees that the date is
+    displayed correctly regardless of the spreadsheet's locale — Sheets
+    stores the number exactly as given and renders it through the format
+    mask.  Writing text strings ('01/06/2026 14:53:16') instead would let
+    Sheets re-parse them with its locale, which can swap day and month
+    when day <= 12.
+    """
+    delta = dt - _SHEETS_EPOCH
+    return delta.days + delta.seconds / 86400.0
 
 
 def parse_cli_dt(s: str, name: str) -> datetime:
@@ -557,8 +580,10 @@ def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
     end_raw   = first(rec, F_END)
     start_dt  = parse_dt(start_raw)
     end_dt    = parse_dt(end_raw)
-    start_cell = start_dt.strftime("%d/%m/%Y %H:%M:%S") if start_dt else start_raw
-    end_cell   = end_dt.strftime("%d/%m/%Y %H:%M:%S") if end_dt else end_raw
+    # Write dates as Sheets serial numbers so the locale never re-interprets
+    # them.  Fall back to the raw string only if parsing fails entirely.
+    start_cell = to_sheets_serial(start_dt) if start_dt else start_raw
+    end_cell   = to_sheets_serial(end_dt)   if end_dt   else end_raw
 
     r = row_num
     return [
@@ -570,26 +595,16 @@ def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
         route,                                        # F  Route
         rcode,                                        # G  Route_Code
         tat_value,                                    # H  Route_TAT
-        start_cell,                                   # I  Start_Time
-        end_cell,                                     # J  End_Time
-        # K  Transit_Time — matches the Apps Script formula (works on
-        # dd/MM/yyyy HH:mm:ss whether stored as datetime or text)
-        (
-            f'=IFERROR('
-            f'(DATE(VALUE(RIGHT(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),4)),'
-            f'VALUE(MID(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),4,2)),'
-            f'VALUE(LEFT(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),2)))'
-            f'+TIMEVALUE(RIGHT(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),8)))'
-            f'-(DATE(VALUE(RIGHT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),4)),'
-            f'VALUE(MID(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),4,2)),'
-            f'VALUE(LEFT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),2)))'
-            f'+TIMEVALUE(RIGHT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),8))),"")'
-        ),
+        start_cell,                                   # I  Start_Time  (serial)
+        end_cell,                                     # J  End_Time    (serial)
+        # K  Transit_Time — both I and J are now real date serials, so
+        # simple subtraction works perfectly (J - I = elapsed days/fraction).
+        f"=IFERROR(J{r}-I{r},\"\")",
         "",                                           # L  Extra_Touching_Time
         f"=IF(L{r}=\"\",K{r},K{r}-L{r})",             # M  Actual_Transit_Time
         f"=IF(M{r}>H{r},M{r}-H{r},0)",                # N  Delay_Hours
         f'=IF(N{r}=0,"On Time","Delayed")',           # O  Status
-        "", "", "", "", "", "", "",                   # P–V  manual money/etc
+        "", "", "", "", "", "", "",                   # P-V  manual money/etc
         False,                                        # W  Close_Status checkbox
     ]
 
@@ -705,7 +720,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Backfill RPS trips into per-hub monthly MIS sheets.")
     ap.add_argument("--days", type=int, default=10,
-                    help="Days back from now (default 10). Ignored with --from/--to.")
+                    help="Days back from now (default 10). Ignored with --from/--to/--month.")
+    ap.add_argument("--month", dest="month", default=None, metavar="YYYY-MM",
+                    help="Full calendar month, e.g. --month 2026-05 (May 2026).")
     ap.add_argument("--from", dest="from_dt",
                     type=lambda s: parse_cli_dt(s, "from"), default=None)
     ap.add_argument("--to",   dest="to_dt",
@@ -714,13 +731,23 @@ def main():
                     help="Fetch + plan, but do not write to sheets.")
     args = ap.parse_args()
 
-    if args.from_dt and args.to_dt:
+    if args.month:
+        # Parse YYYY-MM and expand to full first→last day of that month.
+        try:
+            month_dt = datetime.strptime(args.month.strip(), "%Y-%m")
+        except ValueError:
+            ap.error(f"--month must be YYYY-MM (e.g. 2026-05), got: {args.month!r}")
+        last_day = calendar.monthrange(month_dt.year, month_dt.month)[1]
+        from_dt  = month_dt.replace(day=1)
+        to_dt    = month_dt.replace(day=last_day)
+        label    = f"{MONTHS[month_dt.month - 1]} {month_dt.year} (full month)"
+    elif args.from_dt and args.to_dt:
         if args.from_dt >= args.to_dt:
             ap.error("--from must be earlier than --to")
         from_dt, to_dt = args.from_dt, args.to_dt
         label = (f"{from_dt:%Y-%m-%d}  →  {to_dt:%Y-%m-%d}")
     elif args.from_dt or args.to_dt:
-        ap.error("--from and --to must be used together (or use --days)")
+        ap.error("--from and --to must be used together (or use --days / --month)")
     else:
         to_dt   = datetime.now()
         from_dt = to_dt - timedelta(days=args.days)
@@ -825,15 +852,15 @@ def main():
                     end_val   = None
                     start_val = None
                     if need_end:
-                        end_raw = first(rec, F_END)
-                        end_dt  = parse_dt(end_raw)
-                        if end_dt:
-                            end_val = end_dt.strftime("%d/%m/%Y %H:%M:%S")
+                        end_raw2 = first(rec, F_END)
+                        end_dt2  = parse_dt(end_raw2)
+                        if end_dt2:
+                            end_val = to_sheets_serial(end_dt2)
                     if need_start:
-                        start_raw = first(rec, F_START)
-                        start_dt  = parse_dt(start_raw)
-                        if start_dt:
-                            start_val = start_dt.strftime("%d/%m/%Y %H:%M:%S")
+                        start_raw2 = first(rec, F_START)
+                        start_dt2  = parse_dt(start_raw2)
+                        if start_dt2:
+                            start_val = to_sheets_serial(start_dt2)
                     if end_val or start_val:
                         end_updates.append({
                             "tab":         tab_title,
@@ -870,9 +897,10 @@ def main():
                     if u.get("start_value"):
                         batch.append({"range": f"I{u['row']}",
                                       "values": [[u["start_value"]]]})
+                # Write serial numbers as RAW — locale-independent.
                 if batch:
                     target_ws.batch_update(batch,
-                                           value_input_option="USER_ENTERED")
+                                           value_input_option="RAW")
                 # Re-apply dd/MM/yyyy HH:mm:ss format on every written cell.
                 fmt_reqs: list[dict] = []
                 for u in ups:
