@@ -53,10 +53,15 @@ ROUTE_SLA_TAB   = "Route SLA"
 # Per-hub destination spreadsheets — fill in your hub_name → sheet_id pairs.
 # hub_name MUST match values in the master Vehicles tab "Vehicle Hub" column.
 HUB_TRIP_SHEETS: dict[str, str] = {
-    # "Ambala":       "PUT_AMBALA_MIS_SHEET_ID_HERE",
+    "Ambala":       "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo",
     "Ambala Local": "1SeJ06RjF2ONqCsP53_NO0FEjKhY3EV5UrNtLMmsA2N4",
-    # # Example single destination from earlier conversation:
-    "Ambala": "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo"
+    "Binola":       "1Jz5N01qzwJRStr5Vb9oIU_DeGshiEeL4kLkMiomIeA8",
+}
+
+# Case-/whitespace-insensitive lookup: normalized_hub -> (canonical_name, sheet_id).
+# Built once so "ambala local" / "Ambala  Local" / " AMBALA" still resolve.
+_HUB_TRIP_SHEETS_NORM: dict[str, tuple[str, str]] = {
+    k.strip().lower(): (k, v) for k, v in HUB_TRIP_SHEETS.items()
 }
 
 CREDS_FILE = Path(__file__).parent / "credentials.json"
@@ -773,15 +778,33 @@ def main():
     print(f"  Route SLA:   {len(sla_map)} routes with TAT hours",   flush=True)
     print(f"  Route Codes: {len(rc_map)} hub-name→code mappings",   flush=True)
 
-    # Only ask the RPS API about vehicles whose hub is in HUB_TRIP_SHEETS.
-    target_vehicles = sorted(vno for vno, hub in vehicle_hub.items()
-                             if hub in HUB_TRIP_SHEETS)
+    # Canonicalize each vehicle's hub against HUB_TRIP_SHEETS so the routing
+    # is robust to casing / trailing-space differences in the master Vehicles
+    # tab.  Vehicles whose hub doesn't map to any configured hub are dropped.
+    def _canonical_hub(raw: str) -> str | None:
+        if not raw:
+            return None
+        match = _HUB_TRIP_SHEETS_NORM.get(raw.strip().lower())
+        return match[0] if match else None
+
+    vehicle_hub = {vno: ch
+                   for vno, hub in vehicle_hub.items()
+                   if (ch := _canonical_hub(hub))}
+
+    # Per-hub vehicle counts so misrouting becomes visible at a glance.
+    hub_counts: dict[str, int] = {}
+    for h in vehicle_hub.values():
+        hub_counts[h] = hub_counts.get(h, 0) + 1
+    target_vehicles = sorted(vehicle_hub.keys())
     if not target_vehicles:
         print("[rps_scraper] No vehicles match any hub in HUB_TRIP_SHEETS — "
               "check the master Vehicles tab.", flush=True)
         sys.exit(1)
     print(f"  Targeting:   {len(target_vehicles)} vehicle(s) across "
-          f"{len(HUB_TRIP_SHEETS)} hub(s)", flush=True)
+          f"{len(HUB_TRIP_SHEETS)} hub(s):", flush=True)
+    for hub_name in HUB_TRIP_SHEETS:
+        print(f"    {hub_name:<14} → {hub_counts.get(hub_name, 0):>3} vehicle(s)",
+              flush=True)
 
     # ── Fetch RPS records ─────────────────────────────────────────────────────
     print("\n[rps_scraper] Calling RPS Report API…", flush=True)
