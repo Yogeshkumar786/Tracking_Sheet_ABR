@@ -602,9 +602,22 @@ def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
         tat_value,                                    # H  Route_TAT
         start_cell,                                   # I  Start_Time  (serial)
         end_cell,                                     # J  End_Time    (serial)
-        # K  Transit_Time — both I and J are now real date serials, so
-        # simple subtraction works perfectly (J - I = elapsed days/fraction).
-        f"=IFERROR(J{r}-I{r},\"\")",
+        # K  Transit_Time — mirrors the Apps Script formula exactly so
+        # the result is identical whether the row was written by Python
+        # (serial date) or by Apps Script (dd/MM/yyyy HH:mm:ss text).
+        # TEXT() normalizes both into the same string, then DATE+TIMEVALUE
+        # rebuilds a real datetime for subtraction.
+        (
+            f'=IFERROR('
+            f'(DATE(VALUE(RIGHT(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),4)),'
+            f'VALUE(MID(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),4,2)),'
+            f'VALUE(LEFT(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),2)))'
+            f'+TIMEVALUE(RIGHT(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),8)))'
+            f'-(DATE(VALUE(RIGHT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),4)),'
+            f'VALUE(MID(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),4,2)),'
+            f'VALUE(LEFT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),2)))'
+            f'+TIMEVALUE(RIGHT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),8))),"")'
+        ),
         "",                                           # L  Extra_Touching_Time
         f"=IF(L{r}=\"\",K{r},K{r}-L{r})",             # M  Actual_Transit_Time
         f"=IF(M{r}>H{r},M{r}-H{r},0)",                # N  Delay_Hours
@@ -637,16 +650,28 @@ def format_new_rows(ss, ws, start_row: int, count: int):
             }},
             "fields": "userEnteredFormat.numberFormat",
         }})
-    # [h]:mm on Route_TAT(H=7), Transit_Time(K=10), Actual_Transit_Time(M=12),
-    # Delay_Hours(N=13)
-    for ci in (7, 10, 12, 13):
+    # Route_TAT(H=7) stays as [h]:mm (TAT is whole-hour data, no seconds).
+    # Transit_Time(K=10), Actual_Transit_Time(M=12), Delay_Hours(N=13) use
+    # [h]:mm:ss to match the Apps Script writer so co-existing rows render
+    # the same way in the destination workbook.
+    reqs.append({"repeatCell": {
+        "range": {"sheetId": ws.id,
+                  "startRowIndex": start_row - 1,
+                  "endRowIndex":   start_row - 1 + count,
+                  "startColumnIndex": 7, "endColumnIndex": 8},
+        "cell": {"userEnteredFormat": {
+            "numberFormat": {"type": "TIME", "pattern": "[h]:mm"},
+        }},
+        "fields": "userEnteredFormat.numberFormat",
+    }})
+    for ci in (10, 12, 13):
         reqs.append({"repeatCell": {
             "range": {"sheetId": ws.id,
                       "startRowIndex": start_row - 1,
                       "endRowIndex":   start_row - 1 + count,
                       "startColumnIndex": ci, "endColumnIndex": ci + 1},
             "cell": {"userEnteredFormat": {
-                "numberFormat": {"type": "TIME", "pattern": "[h]:mm"},
+                "numberFormat": {"type": "TIME", "pattern": "[h]:mm:ss"},
             }},
             "fields": "userEnteredFormat.numberFormat",
         }})
