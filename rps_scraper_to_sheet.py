@@ -650,21 +650,14 @@ def format_new_rows(ss, ws, start_row: int, count: int):
             }},
             "fields": "userEnteredFormat.numberFormat",
         }})
-    # Route_TAT(H=7) stays as [h]:mm (TAT is whole-hour data, no seconds).
-    # Transit_Time(K=10), Actual_Transit_Time(M=12), Delay_Hours(N=13) use
-    # [h]:mm:ss to match the Apps Script writer so co-existing rows render
-    # the same way in the destination workbook.
-    reqs.append({"repeatCell": {
-        "range": {"sheetId": ws.id,
-                  "startRowIndex": start_row - 1,
-                  "endRowIndex":   start_row - 1 + count,
-                  "startColumnIndex": 7, "endColumnIndex": 8},
-        "cell": {"userEnteredFormat": {
-            "numberFormat": {"type": "TIME", "pattern": "[h]:mm"},
-        }},
-        "fields": "userEnteredFormat.numberFormat",
-    }})
-    for ci in (10, 12, 13):
+    # All duration columns use [h]:mm:ss to match the Apps Script writers
+    # (transferToMIS / transferRpsToHubMIS) so co-existing rows from either
+    # source render identically:
+    #   H  Route_TAT
+    #   K  Transit_Time
+    #   M  Actual_Transit_Time
+    #   N  Delay_Hours
+    for ci in (7, 10, 12, 13):
         reqs.append({"repeatCell": {
             "range": {"sheetId": ws.id,
                       "startRowIndex": start_row - 1,
