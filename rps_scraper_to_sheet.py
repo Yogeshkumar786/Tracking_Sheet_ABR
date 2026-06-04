@@ -4,13 +4,21 @@ RPS Scraper -> Per-Hub Monthly MIS sheets  (FULLY INDEPENDENT)
 For a given date range, pulls all RPS trips from the FMS RPS Report API
 and writes them to each hub's monthly MIS tab (e.g. May_2026_MIS).
 
-Dedup rule (the whole point of this rewrite):
+Dedup rule:
     If RPS_Number already exists anywhere in the destination workbook's
     *_MIS tabs, the row is SKIPPED. Existing rows are never overwritten.
     Re-running the script is safe and produces zero duplicates.
 
-This script has ZERO imports from fms_to_sheet.py. Everything it needs
-(credentials, API call, vehicle→hub mapping, sheet writers) is inlined.
+Reliability rules (added after a 429 quota crash):
+    * Every Sheets API call is wrapped in _retry(): on 429 / 5xx we back
+      off exponentially (20s, 40s, 80s, 160s, 320s) up to 6 attempts.
+    * If a workbook's dedup scan ULTIMATELY fails, that workbook is
+      SKIPPED for writes — we never assume "no known RPS" because that
+      would duplicate every record on the next pass.
+    * Each new row's value + format + checkbox writes go in ONE
+      atomic spreadsheets.batchUpdate request. If the call errors mid-
+      transmission, Sheets rolls the request back; the row will either
+      be fully present or fully absent (never half).
 
 USAGE
 -----
@@ -26,8 +34,10 @@ import argparse
 import calendar
 import json
 import os
+import random
 import re
 import sys
+import time
 import traceback
 import warnings
 from datetime import datetime, timedelta
@@ -44,29 +54,23 @@ load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-# Master spreadsheet — used ONLY to read Vehicles, Route Codes, Route SLA tabs.
 MASTER_SHEET_ID = "1-tEwE7YwZFNhfGjvgZPHYMKXJqSr_TOmrAodfuadGf0"
 VEHICLES_TAB    = "Vehicles"
 ROUTE_CODES_TAB = "Route Codes"
 ROUTE_SLA_TAB   = "Route SLA"
 
-# Per-hub destination spreadsheets — fill in your hub_name → sheet_id pairs.
-# hub_name MUST match values in the master Vehicles tab "Vehicle Hub" column.
 HUB_TRIP_SHEETS: dict[str, str] = {
     "Ambala":       "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo",
     "Ambala Local": "1SeJ06RjF2ONqCsP53_NO0FEjKhY3EV5UrNtLMmsA2N4",
     "Binola":       "1Jz5N01qzwJRStr5Vb9oIU_DeGshiEeL4kLkMiomIeA8",
 }
 
-# Case-/whitespace-insensitive lookup: normalized_hub -> (canonical_name, sheet_id).
-# Built once so "ambala local" / "Ambala  Local" / " AMBALA" still resolve.
 _HUB_TRIP_SHEETS_NORM: dict[str, tuple[str, str]] = {
     k.strip().lower(): (k, v) for k, v in HUB_TRIP_SHEETS.items()
 }
 
 CREDS_FILE = Path(__file__).parent / "credentials.json"
 
-# RPS Report API
 RPS_REPORT_URL = (
     "http://smart.dsmsoft.com/FMSSmartApp/"
     "Safex_RPS_Reports/WebService.asmx/getRpsReportData"
@@ -82,10 +86,9 @@ RPS_REPORT_HEADERS = {
                          "AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/148.0.0.0 Safari/537.36"),
 }
-RPS_REQUEST_TIMEOUT = 60   # seconds
-RPS_BATCH_SIZE      = 50   # vehicles per API call (server-side limit varies)
+RPS_REQUEST_TIMEOUT = 60
+RPS_BATCH_SIZE      = 50
 
-# Destination tab schema — kept in sync with the Apps Script the user defined.
 TRIP_HEADERS = [
     "RPS_Number", "Vehicle_Number", "Vehicle_Size",
     "Driver_Name", "Driver_Code",
@@ -99,13 +102,12 @@ TRIP_HEADERS = [
 ]
 TRIP_NCOLS = len(TRIP_HEADERS)
 
-HEADER_COLOR = {"red": 0.043, "green": 0.329, "blue": 0.580}  # #0b5394
+HEADER_COLOR = {"red": 0.043, "green": 0.329, "blue": 0.580}
 WHITE        = {"red": 1.0,   "green": 1.0,   "blue": 1.0}
 
 MONTHS = ["January","February","March","April","May","June",
          "July","August","September","October","November","December"]
 
-# Field-name fallbacks for the RPS Report API (names vary across versions).
 F_RPS     = ("RPS_Number", "rpsNumber", "rps_number", "rpsNo", "RPS_No",
              "lrNumber", "tripId")
 F_VEH     = ("Vehicle_Number", "vehicleNumber", "vehicle_no", "vehicleNo",
@@ -121,6 +123,57 @@ F_START   = ("Start_Time", "dispatchDate", "DISPATCH_DATE", "dispatch_date",
              "startDate", "START_TIME", "tripStartDate")
 F_END     = ("End_Time", "POD_DATE", "pod_date", "closureDate", "endDate",
              "END_TIME", "DELIVERY_DATE", "podDate")
+
+
+# ── 429 / 5xx retry helper ────────────────────────────────────────────────────
+# Sheets enforces 60 reads + 60 writes / minute / user.  A full Binola dedup
+# sweep can blow past that on its own.  Every gspread call below is routed
+# through _retry() so a quota hit triggers exponential backoff instead of a
+# crash that would leave the run half-applied.
+
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, gspread.exceptions.APIError):
+        msg = str(exc)
+        if any(f"[{s}]" in msg for s in _RETRY_STATUSES):
+            return True
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        return status in _RETRY_STATUSES
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    return False
+
+
+def _retry(fn, *args, _label: str = "", max_attempts: int = 6,
+           base_delay: float = 20.0, **kwargs):
+    """Run fn(*args, **kwargs); retry on 429/5xx with exponential backoff.
+
+    Backoff sequence: 20s, 40s, 80s, 160s, 320s (with up to +3s jitter
+    per step so parallel runners don't synchronize).  After max_attempts
+    the original exception is re-raised so the caller can decide.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable(exc) or attempt == max_attempts:
+                if attempt == max_attempts:
+                    print(f"  [retry]{(' ' + _label) if _label else ''} "
+                          f"giving up after {max_attempts} attempts: {exc}",
+                          flush=True)
+                raise
+            delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 3)
+            tag = f" {_label}" if _label else ""
+            print(f"  [retry]{tag} 429/5xx; sleeping {delay:.1f}s "
+                  f"(attempt {attempt}/{max_attempts})", flush=True)
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -141,14 +194,8 @@ def first(rec: dict, keys: tuple) -> str:
     return ""
 
 
-def parse_dt(s: str) -> datetime | None:
-    if not s:
-        return None
-    s = str(s).strip()
-    for f in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S",
-              "%d-%m-%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S",
-              "%d/%m/%Y %I:%M:%S %p", "%Y-%m-%dT%H:%M:%S",
-              "%d/%m/%Y", "%Y-%m-%d"):
+def _try_parse(s: str, formats: tuple) -> datetime | None:
+    for f in formats:
         try:
             return datetime.strptime(s, f)
         except ValueError:
@@ -156,23 +203,66 @@ def parse_dt(s: str) -> datetime | None:
     return None
 
 
-# Google Sheets / Excel date serial helpers.
-# Sheets counts days from 30-Dec-1899 (Dec 30, 1899 = 0) and inherits
-# Lotus-1-2-3's fictitious Feb-29-1900, which shifts every post-Feb-1900
-# date up by 1.  Using Dec 30, 1899 as epoch already bakes that +1 in.
+# Slash-date ambiguity: the DSM Soft RPS API serializes dates in **MM/DD/YYYY**
+# order, but `02/06/2026` is locally valid in either MM/DD or DD/MM, so the
+# parser silently swapped day & month before.  We now try MM/DD-first AND keep
+# a DD/MM-first variant for the rescue path in parse_dt_pair().
+_FMTS_MMDD_FIRST = (
+    "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %I:%M:%S %p", "%d/%m/%Y %I:%M:%S %p",
+    "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d",
+)
+_FMTS_DDMM_FIRST = (
+    "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M:%S %p",
+    "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d",
+)
+
+
+def parse_dt(s: str) -> datetime | None:
+    """Single-value parser. Tries MM/DD-first to match the API."""
+    if not s:
+        return None
+    return _try_parse(str(s).strip(), _FMTS_MMDD_FIRST)
+
+
+def parse_dt_pair(start_raw: str, end_raw: str
+                  ) -> tuple[datetime | None, datetime | None]:
+    """Parse Start / End together so the day/month interpretation can be
+    cross-validated.  If MM/DD-first yields an impossible pair (End < Start,
+    or > 60-day trip) we retry with DD/MM-first.  This rescues the rare row
+    where DSM Soft flips locale on us.
+    """
+    s = str(start_raw or "").strip()
+    e = str(end_raw   or "").strip()
+    start_a = _try_parse(s, _FMTS_MMDD_FIRST) if s else None
+    end_a   = _try_parse(e, _FMTS_MMDD_FIRST) if e else None
+
+    def _plausible(a: datetime | None, b: datetime | None) -> bool:
+        if a is None:
+            return False
+        if b is None:
+            return True
+        return b >= a and (b - a).days <= 60
+
+    if _plausible(start_a, end_a):
+        return start_a, end_a
+
+    start_b = _try_parse(s, _FMTS_DDMM_FIRST) if s else None
+    end_b   = _try_parse(e, _FMTS_DDMM_FIRST) if e else None
+    if _plausible(start_b, end_b):
+        print(f"  [date] DD/MM rescue: '{s}' / '{e}' → "
+              f"{start_b} / {end_b}", flush=True)
+        return start_b, end_b
+
+    return start_a, end_a
+
+
 _SHEETS_EPOCH = datetime(1899, 12, 30)
 
-def to_sheets_serial(dt: datetime) -> float:
-    """Convert a datetime to a Google Sheets date serial number.
 
-    Writing the result as a RAW numeric value and then applying the
-    'dd/MM/yyyy HH:mm:ss' number format guarantees that the date is
-    displayed correctly regardless of the spreadsheet's locale — Sheets
-    stores the number exactly as given and renders it through the format
-    mask.  Writing text strings ('01/06/2026 14:53:16') instead would let
-    Sheets re-parse them with its locale, which can swap day and month
-    when day <= 12.
-    """
+def to_sheets_serial(dt: datetime) -> float:
+    """datetime → Google Sheets date serial number."""
     delta = dt - _SHEETS_EPOCH
     return delta.days + delta.seconds / 86400.0
 
@@ -200,8 +290,7 @@ def gspread_client():
 
 
 def load_vehicles_tab(ws) -> tuple[dict, dict]:
-    """Master Vehicles tab → ({vno: hub}, {vno: vehicle_type})."""
-    rows = ws.get_all_values()
+    rows = _retry(ws.get_all_values, _label="Vehicles.get_all_values")
     hub_map: dict[str, str] = {}
     vt_map:  dict[str, str] = {}
     for r in rows[1:]:
@@ -216,7 +305,7 @@ def load_vehicles_tab(ws) -> tuple[dict, dict]:
 
 
 def load_route_sla(ws) -> dict[str, float]:
-    rows = ws.get_all_values()
+    rows = _retry(ws.get_all_values, _label="Route SLA.get_all_values")
     sla: dict[str, float] = {}
     for r in rows[1:]:
         code = (r[0].strip() if len(r) > 0 else "").upper()
@@ -231,12 +320,7 @@ def load_route_sla(ws) -> dict[str, float]:
 
 
 def load_route_codes(ws) -> tuple[dict[str, str], list[tuple[str, str]]]:
-    """Return ({HUB_NAME_UPPER: code}, [(hub_name, code), …]).
-
-    The dict is used for exact lookups. The list keeps the original (cased)
-    names so the fuzzy matcher in derive_route_code() can score against them.
-    """
-    rows = ws.get_all_values()
+    rows = _retry(ws.get_all_values, _label="Route Codes.get_all_values")
     out: dict[str, str] = {}
     items: list[tuple[str, str]] = []
     for r in rows[1:]:
@@ -249,11 +333,6 @@ def load_route_codes(ws) -> tuple[dict[str, str], list[tuple[str, str]]]:
 
 
 # ── Route_Code derivation ─────────────────────────────────────────────────────
-# Produces the SAME output format as fms_to_sheet.build_route_code():
-#   "ORIGIN-VIA1;VIA2;…;FINAL"      e.g.  "BLO11-BBO11;BNA11"
-# The RPS API returns the route as a verbose "/"-separated path, e.g.:
-#   "BENGALURU OUTBOUND-11 / SAFEXPRESS GURUGRAM SDS (BBO11) / SAFEXPRESS BINOLA (BNA11)"
-# so we resolve a code for each segment and re-assemble.
 
 _HUB_CODE_RE = re.compile(r"\(([A-Z0-9]+)\)\s*$", re.IGNORECASE)
 _EMBEDDED_CODE_RE = re.compile(r"\b([A-Z]{2,5}\d{2,3})\b")
@@ -268,18 +347,15 @@ def _extract_segment_code(segment: str, hub_map: dict[str, str]) -> str:
     text = str(segment or "").strip()
     if not text:
         return ""
-    # "(CODE)" anywhere — trailing parens preferred, but any parens accepted
     m = _HUB_CODE_RE.search(text)
     if m:
         return m.group(1).upper()
     m2 = re.search(r"\(([^()]+)\)", text)
     if m2:
         return m2.group(1).strip().upper()
-    # Bare code embedded in name (e.g. "INDORE-11" → none, "BLR11 hub" → BLR11)
     m3 = _EMBEDDED_CODE_RE.search(text.upper())
     if m3:
         return m3.group(1).upper()
-    # Fall back to Route Codes tab lookup
     key  = text.upper()
     norm = re.sub(r"\([^)]*\)", "", text).strip().upper()
     return str(hub_map.get(key) or hub_map.get(norm) or "").strip().upper()
@@ -294,7 +370,6 @@ def _route_tokens(text: str) -> set[str]:
 
 def _best_code_guess(segment: str,
                      route_code_items: list[tuple[str, str]]) -> str:
-    """Fuzzy match a segment against (hub_name, hub_code) pairs by token overlap."""
     seg_tokens = _route_tokens(segment)
     if not seg_tokens:
         return ""
@@ -318,14 +393,12 @@ def _best_code_guess(segment: str,
 def derive_route_code(route_name: str,
                       hub_map: dict[str, str],
                       route_code_items: list[tuple[str, str]]) -> str:
-    """Split the RPS route on '/', resolve each segment, format ORIGIN-VIA;FINAL."""
     route = str(route_name or "").strip()
     if not route:
         return ""
     parts = [p.strip() for p in route.split("/") if p.strip()]
     if not parts:
         return ""
-
     codes: list[str] = []
     for part in parts:
         code = _extract_segment_code(part, hub_map)
@@ -333,7 +406,6 @@ def derive_route_code(route_name: str,
             code = _best_code_guess(part, route_code_items)
         if code:
             codes.append(code)
-
     if not codes:
         return ""
     if len(codes) == 1:
@@ -343,28 +415,22 @@ def derive_route_code(route_name: str,
 
 # ── Destination tab handling ──────────────────────────────────────────────────
 
-
 def _delete_named_columns(ss, ws, names: set[str]):
-    """Delete any column whose header (row 1) matches one of `names`.
-
-    Catches the '_sort_key' column re-injected by the destination workbook's
-    own Apps Script, even after `_strip_extra_columns` removed it once.
-    """
     try:
-        header = ws.row_values(1)
+        header = _retry(ws.row_values, 1, _label=f"{ws.title}.row_values")
     except Exception:
         return
     targets = [i for i, h in enumerate(header)
                if (h or "").strip().lower() in {n.lower() for n in names}]
     if not targets:
         return
-    # Delete right-to-left so earlier indices stay valid.
     reqs = [{"deleteDimension": {
                 "range": {"sheetId": ws.id, "dimension": "COLUMNS",
                           "startIndex": i, "endIndex": i + 1},
             }} for i in sorted(targets, reverse=True)]
     try:
-        ss.batch_update({"requests": reqs})
+        _retry(ss.batch_update, {"requests": reqs},
+               _label=f"{ws.title}.delete_named_columns")
         print(f"  [strip] {ws.title}: deleted {len(targets)} foreign "
               f"column(s) by name {names}", flush=True)
     except Exception as exc:
@@ -373,17 +439,10 @@ def _delete_named_columns(ss, ws, names: set[str]):
 
 
 def _strip_extra_columns(ss, ws):
-    """Delete any columns past column W (TRIP_NCOLS), regardless of header.
-
-    Defensive: a foreign Apps Script bound to the destination spreadsheet
-    has been observed appending a '_sort_key' helper column to newly
-    created tabs. We don't want it, so we nuke anything past our schema
-    every time we touch the tab.
-    """
-    # ws.col_count can be stale (gspread caches metadata). Refetch.
     try:
-        meta = ss.fetch_sheet_metadata(
-            params={"fields": "sheets(properties(sheetId,gridProperties))"})
+        meta = _retry(ss.fetch_sheet_metadata,
+                      params={"fields": "sheets(properties(sheetId,gridProperties))"},
+                      _label=f"{ss.id}.fetch_sheet_metadata")
         actual_cols = next(
             (s["properties"]["gridProperties"]["columnCount"]
              for s in meta.get("sheets", [])
@@ -396,14 +455,14 @@ def _strip_extra_columns(ss, ws):
     if actual_cols <= TRIP_NCOLS:
         return
     try:
-        ss.batch_update({"requests": [{"deleteDimension": {
+        _retry(ss.batch_update, {"requests": [{"deleteDimension": {
             "range": {
                 "sheetId":    ws.id,
                 "dimension":  "COLUMNS",
-                "startIndex": TRIP_NCOLS,        # 0-based; col 23 = X
+                "startIndex": TRIP_NCOLS,
                 "endIndex":   actual_cols,
             },
-        }}]})
+        }}]}, _label=f"{ws.title}.strip_extra_columns")
     except Exception as exc:
         print(f"  [strip] {ws.title}: column trim skipped ({exc})", flush=True)
 
@@ -411,18 +470,23 @@ def _strip_extra_columns(ss, ws):
 def get_or_create_trip_tab(ss, tab_name: str):
     try:
         ws = ss.worksheet(tab_name)
-        if ws.row_values(1) != TRIP_HEADERS:
-            ws.update(values=[TRIP_HEADERS], range_name="A1",
-                      value_input_option="RAW")
+        header = _retry(ws.row_values, 1, _label=f"{tab_name}.row_values")
+        if header != TRIP_HEADERS:
+            _retry(ws.update, values=[TRIP_HEADERS], range_name="A1",
+                   value_input_option="RAW",
+                   _label=f"{tab_name}.update_header")
         _delete_named_columns(ss, ws, {"_sort_key", "_sortKey", "sort_key"})
         _strip_extra_columns(ss, ws)
         return ws
     except gspread.WorksheetNotFound:
         pass
 
-    ws = ss.add_worksheet(title=tab_name, rows=2000, cols=TRIP_NCOLS)
-    ws.update(values=[TRIP_HEADERS], range_name="A1", value_input_option="RAW")
-    ss.batch_update({"requests": [
+    ws = _retry(ss.add_worksheet, title=tab_name, rows=2000, cols=TRIP_NCOLS,
+                _label=f"add_worksheet({tab_name})")
+    _retry(ws.update, values=[TRIP_HEADERS], range_name="A1",
+           value_input_option="RAW",
+           _label=f"{tab_name}.write_header")
+    _retry(ss.batch_update, {"requests": [
         {"repeatCell": {
             "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
                       "startColumnIndex": 0, "endColumnIndex": TRIP_NCOLS},
@@ -435,13 +499,11 @@ def get_or_create_trip_tab(ss, tab_name: str):
             "fields": ("userEnteredFormat("
                        "backgroundColor,textFormat,horizontalAlignment)"),
         }},
-        # Freeze header
         {"updateSheetProperties": {
             "properties": {"sheetId": ws.id,
                            "gridProperties": {"frozenRowCount": 1}},
             "fields": "gridProperties.frozenRowCount",
         }},
-        # Close_Status checkbox for all data rows up-front
         {"setDataValidation": {
             "range": {"sheetId": ws.id, "startRowIndex": 1,
                       "endRowIndex": 2000,
@@ -449,83 +511,63 @@ def get_or_create_trip_tab(ss, tab_name: str):
                       "endColumnIndex": TRIP_NCOLS},
             "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
         }},
-    ]})
+    ]}, _label=f"{tab_name}.init_format")
     _strip_extra_columns(ss, ws)
     return ws
 
 
 def _normalize_rps(v) -> str:
-    """Canonicalize an RPS value so dedup ignores formatting differences.
-
-    Google Sheets stores RPS_Number cells as numbers (USER_ENTERED parses
-    "7965359" as 7965359). On read-back, FORMATTED_VALUE may come through
-    as "7,965,359" or "7.96E+06" depending on cell format — none of which
-    match the raw "7965359" string the API returned. So we strip every
-    non-digit/letter char and trim, then compare.
-    """
     if v is None:
         return ""
     if isinstance(v, float) and v.is_integer():
         v = int(v)
     s = str(v).strip()
-    # Drop commas, spaces, decimal trailing zeros from "7965359.0"
     if s.endswith(".0") and s[:-2].isdigit():
         s = s[:-2]
     s = s.replace(",", "").replace(" ", "")
-    # API returns RPS with leading zeros ('0007944139'); sheet stores the
-    # number 7944139 and loses them on read-back. Strip leading zeros so
-    # both sides canonicalize to the same key.
     if s.isdigit():
         s = s.lstrip("0") or "0"
     return s
 
 
-def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int, bool, bool]]]:
-    """Scan every *_MIS tab and return:
-        all_rps  : {normalized_rps}
-            — every RPS number already in this workbook (for dedup).
-              No new row will be inserted for these.
-        backfill : {normalized_rps: (tab_name, row, need_start, need_end)}
-            — rows missing Start_Time and/or End_Time that should be
-              updated on the next run.  need_start / need_end are True
-              when the corresponding cell is blank.  Both fields are
-              tracked and filled INDEPENDENTLY of each other.
+class DedupReadError(Exception):
+    """Raised when we couldn't reliably read existing RPS rows. The caller
+    MUST skip writes to that workbook — otherwise we'd duplicate everything.
+    """
 
-    Uses UNFORMATTED_VALUE so number-formatted RPS cells (7,965,359 /
-    scientific notation) round-trip correctly.
+
+def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int, bool, bool]]]:
+    """Scan every *_MIS tab and collect existing RPS numbers + back-fill
+    candidates.  Raises DedupReadError if any tab can't be read — we'd
+    rather skip writes than duplicate.
     """
     all_rps:  set[str] = set()
     backfill: dict[str, tuple[str, int, bool, bool]] = {}
-    for ws in ss.worksheets():
+    worksheets = _retry(ss.worksheets, _label=f"{ss.id}.worksheets")
+    for ws in worksheets:
         if not ws.title.endswith("_MIS"):
             continue
-        rows_data: list = []   # (rps, start, end) tuples starting at sheet row 2
+        # Tiny pause between tabs softens the read-quota pressure.
+        time.sleep(1.0)
+
+        rows_data: list = []
         try:
-            resp = ss.values_get(
+            resp = _retry(
+                ss.values_get,
                 f"'{ws.title}'!A2:J",
                 params={"valueRenderOption": "UNFORMATTED_VALUE"},
+                _label=f"{ws.title}.values_get",
             )
             for row in resp.get("values", []):
                 rps_cell   = row[0] if len(row) > 0 else ""
-                start_cell = row[8] if len(row) > 8 else ""   # col I
-                end_cell   = row[9] if len(row) > 9 else ""   # col J
+                start_cell = row[8] if len(row) > 8 else ""
+                end_cell   = row[9] if len(row) > 9 else ""
                 rows_data.append((rps_cell, start_cell, end_cell))
         except Exception as exc:
-            print(f"  [dedup] {ws.title}: values_get failed ({exc}), "
-                  f"falling back to col_values", flush=True)
-            try:
-                a     = ws.col_values(1)[1:]
-                i_col = ws.col_values(9)[1:]   # col I = Start_Time
-                j     = ws.col_values(10)[1:]  # col J = End_Time
-                rows_data = list(zip(
-                    a,
-                    i_col + [""] * max(0, len(a) - len(i_col)),
-                    j     + [""] * max(0, len(a) - len(j)),
-                ))
-            except Exception as exc2:
-                print(f"  [dedup] {ws.title}: col_values failed ({exc2})",
-                      flush=True)
-                continue
+            # After 6 retries with 5-minute total backoff, give up safely
+            # rather than silently treat the tab as empty.
+            raise DedupReadError(
+                f"could not read {ws.title} after retries: {exc}") from exc
 
         loaded = 0
         backfill_candidates = 0
@@ -544,10 +586,7 @@ def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int, bo
                     backfill[key] = (ws.title, i, need_start, need_end)
                     backfill_candidates += 1
             else:
-                # Row is fully complete — remove stale backfill entry if any.
                 backfill.pop(key, None)
-        bf_start = sum(1 for _, _, ns, _ in backfill.values() if ns)
-        bf_end   = sum(1 for _, _, _, ne in backfill.values() if ne)
         print(f"  [dedup] {ws.title}: {loaded} RPS row(s); "
               f"{backfill_candidates} needing backfill", flush=True)
     print(f"  [dedup] Workbook totals: {len(all_rps)} known RPS, "
@@ -557,10 +596,26 @@ def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int, bo
     return all_rps, backfill
 
 
-def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
-              rc_items: list[tuple[str, str]],
-              row_num: int) -> list:
-    """Build one destination row. row_num is 1-based for the formulas."""
+# ── Row builders ──────────────────────────────────────────────────────────────
+
+def _duration_fmt() -> dict:
+    """Sheets 'Duration' number-format object.
+
+    Internally Duration is a NUMBER type with the [h]:mm:ss pattern — the
+    brackets around `h` make hours cumulative beyond 24, which is what we
+    want for Transit_Time / Actual_Transit_Time / Delay_Hours / Route_TAT.
+    """
+    return {"type": "NUMBER", "pattern": "[h]:mm:ss"}
+
+
+def _datetime_fmt() -> dict:
+    return {"type": "DATE_TIME", "pattern": "dd/MM/yyyy HH:mm:ss"}
+
+
+def build_row_values(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
+                     rc_items: list[tuple[str, str]],
+                     row_num: int) -> tuple[list, datetime | None, datetime | None]:
+    """Return (values_for_row, start_dt, end_dt). row_num is 1-based."""
     rps    = first(rec, F_RPS)
     vno    = first(rec, F_VEH).upper()
     vtype  = first(rec, F_VTYPE) or vt_map.get(vno, "")
@@ -568,45 +623,23 @@ def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
     dcode  = first(rec, F_DRIVER_CODE)
     route  = first(rec, F_ROUTE)
 
-    # Route_Code — ALWAYS derive from the Route field so the output matches
-    # fms_to_sheet.build_route_code()'s "ORIGIN-VIA;FINAL" format. The
-    # API's own Route_Code (when present) is verbose like "DR_…" and not
-    # what the live tracker uses.
     rcode = derive_route_code(route, rc_map, rc_items)
     if not rcode:
-        # Last-ditch: take whatever the API gave us.
         rcode = first(rec, F_RCODE)
 
-    # Route_TAT as a day-fraction so [h]:mm formatting + arithmetic work.
     tat_hours = sla_map.get(rcode.upper()) if rcode else None
     tat_value = (tat_hours / 24.0) if tat_hours else ""
 
     start_raw = first(rec, F_START)
     end_raw   = first(rec, F_END)
-    start_dt  = parse_dt(start_raw)
-    end_dt    = parse_dt(end_raw)
-    # Write dates as Sheets serial numbers so the locale never re-interprets
-    # them.  Fall back to the raw string only if parsing fails entirely.
+    start_dt, end_dt = parse_dt_pair(start_raw, end_raw)
     start_cell = to_sheets_serial(start_dt) if start_dt else start_raw
     end_cell   = to_sheets_serial(end_dt)   if end_dt   else end_raw
 
     r = row_num
     return [
-        rps,                                          # A  RPS_Number
-        vno,                                          # B  Vehicle_Number
-        vtype,                                        # C  Vehicle_Size
-        driver,                                       # D  Driver_Name
-        dcode,                                        # E  Driver_Code
-        route,                                        # F  Route
-        rcode,                                        # G  Route_Code
-        tat_value,                                    # H  Route_TAT
-        start_cell,                                   # I  Start_Time  (serial)
-        end_cell,                                     # J  End_Time    (serial)
-        # K  Transit_Time — mirrors the Apps Script formula exactly so
-        # the result is identical whether the row was written by Python
-        # (serial date) or by Apps Script (dd/MM/yyyy HH:mm:ss text).
-        # TEXT() normalizes both into the same string, then DATE+TIMEVALUE
-        # rebuilds a real datetime for subtraction.
+        rps, vno, vtype, driver, dcode, route, rcode,
+        tat_value, start_cell, end_cell,
         (
             f'=IFERROR('
             f'(DATE(VALUE(RIGHT(TEXT(J{r},"dd/MM/yyyy HH:mm:ss"),4)),'
@@ -618,73 +651,94 @@ def build_row(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
             f'VALUE(LEFT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),2)))'
             f'+TIMEVALUE(RIGHT(TEXT(I{r},"dd/MM/yyyy HH:mm:ss"),8))),"")'
         ),
-        "",                                           # L  Extra_Touching_Time
-        f"=IF(L{r}=\"\",K{r},K{r}-L{r})",             # M  Actual_Transit_Time
-        f"=IF(M{r}>H{r},M{r}-H{r},0)",                # N  Delay_Hours
-        f'=IF(N{r}=0,"On Time","Delayed")',           # O  Status
-        "", "", "", "", "", "", "",                   # P-V  manual money/etc
-        False,                                        # W  Close_Status checkbox
-    ]
+        "",
+        f"=IF(L{r}=\"\",K{r},K{r}-L{r})",
+        f"=IF(M{r}>H{r},M{r}-H{r},0)",
+        f'=IF(N{r}=0,"On Time","Delayed")',
+        "", "", "", "", "", "", "",
+        False,
+    ], start_dt, end_dt
 
 
-def format_new_rows(ss, ws, start_row: int, count: int):
-    """Apply date format to I/J, [h]:mm to H/K/M/N, and the BOOLEAN/checkbox
-    data-validation rule to Close_Status (W) for the just-written rows.
+def _row_to_cell_data(row_values: list) -> list[dict]:
+    """Convert a list of Python values into Sheets API CellData objects,
+    embedding both the value AND the number format so a single
+    updateCells request writes everything atomically.
 
-    The checkbox rule MUST be re-applied on every write — the tab-creation
-    rule covers rows 1–2000 only and is absent on legacy tabs, so the
-    raw `False` value would otherwise render as plain text instead of an
-    unchecked checkbox.
+    Column index → format:
+        7  H Route_TAT             Duration
+        8  I Start_Time            DateTime
+        9  J End_Time              DateTime
+        10 K Transit_Time          Duration  (formula)
+        12 M Actual_Transit_Time   Duration  (formula)
+        13 N Delay_Hours           Duration  (formula)
+        22 W Close_Status          checkbox  (handled via dataValidation)
     """
-    reqs = []
-    # Date format on Start_Time (I=8 zero-based) and End_Time (J=9)
-    for ci in (8, 9):
-        reqs.append({"repeatCell": {
-            "range": {"sheetId": ws.id,
-                      "startRowIndex": start_row - 1,
-                      "endRowIndex":   start_row - 1 + count,
-                      "startColumnIndex": ci, "endColumnIndex": ci + 1},
-            "cell": {"userEnteredFormat": {
-                "numberFormat": {"type": "DATE_TIME",
-                                 "pattern": "dd/MM/yyyy HH:mm:ss"},
-            }},
-            "fields": "userEnteredFormat.numberFormat",
-        }})
-    # All duration columns use [h]:mm:ss to match the Apps Script writers
-    # (transferToMIS / transferRpsToHubMIS) so co-existing rows from either
-    # source render identically:
-    #   H  Route_TAT
-    #   K  Transit_Time
-    #   M  Actual_Transit_Time
-    #   N  Delay_Hours
-    for ci in (7, 10, 12, 13):
-        reqs.append({"repeatCell": {
-            "range": {"sheetId": ws.id,
-                      "startRowIndex": start_row - 1,
-                      "endRowIndex":   start_row - 1 + count,
-                      "startColumnIndex": ci, "endColumnIndex": ci + 1},
-            "cell": {"userEnteredFormat": {
-                "numberFormat": {"type": "TIME", "pattern": "[h]:mm:ss"},
-            }},
-            "fields": "userEnteredFormat.numberFormat",
-        }})
-    # Checkbox validation on Close_Status (W = last column)
-    reqs.append({"setDataValidation": {
-        "range": {"sheetId": ws.id,
-                  "startRowIndex": start_row - 1,
-                  "endRowIndex":   start_row - 1 + count,
-                  "startColumnIndex": TRIP_NCOLS - 1,
-                  "endColumnIndex":   TRIP_NCOLS},
-        "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
-    }})
-    if reqs:
-        ss.batch_update({"requests": reqs})
+    duration_cols = {7, 10, 12, 13}
+    datetime_cols = {8, 9}
+    out: list[dict] = []
+    for ci, v in enumerate(row_values):
+        cd: dict = {}
+        # Value
+        if isinstance(v, str) and v.startswith("="):
+            cd["userEnteredValue"] = {"formulaValue": v}
+        elif isinstance(v, bool):
+            cd["userEnteredValue"] = {"boolValue": v}
+        elif isinstance(v, (int, float)):
+            cd["userEnteredValue"] = {"numberValue": float(v)}
+        elif v == "" or v is None:
+            cd["userEnteredValue"] = {"stringValue": ""}
+        else:
+            cd["userEnteredValue"] = {"stringValue": str(v)}
+        # Format
+        fmt_obj: dict | None = None
+        if ci in datetime_cols:
+            fmt_obj = _datetime_fmt()
+        elif ci in duration_cols:
+            fmt_obj = _duration_fmt()
+        if fmt_obj is not None:
+            cd["userEnteredFormat"] = {"numberFormat": fmt_obj}
+        out.append(cd)
+    return out
+
+
+def write_rows_atomically(ss, ws, start_row: int, rows: list[list]) -> None:
+    """Write `rows` starting at sheet row `start_row` as a SINGLE
+    spreadsheets.batchUpdate request — values, number formats, AND
+    checkbox data-validation all land together or not at all.
+
+    No retry is allowed to write a partial state: the call is one network
+    request, and Sheets applies it transactionally.  If _retry() ultimately
+    raises, NOTHING was written for these rows.
+    """
+    if not rows:
+        return
+    grid_rows = [{"values": _row_to_cell_data(r)} for r in rows]
+    requests = [
+        {"updateCells": {
+            "rows":   grid_rows,
+            "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+            "start":  {"sheetId":     ws.id,
+                       "rowIndex":    start_row - 1,
+                       "columnIndex": 0},
+        }},
+        # Re-apply checkbox validation on the just-written W column.
+        {"setDataValidation": {
+            "range": {"sheetId":          ws.id,
+                      "startRowIndex":    start_row - 1,
+                      "endRowIndex":      start_row - 1 + len(rows),
+                      "startColumnIndex": TRIP_NCOLS - 1,
+                      "endColumnIndex":   TRIP_NCOLS},
+            "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
+        }},
+    ]
+    _retry(ss.batch_update, {"requests": requests},
+           _label=f"{ws.title}.atomic_write[{len(rows)}rows]")
 
 
 # ── RPS API ───────────────────────────────────────────────────────────────────
 
 def _parse_rps_response(body) -> list[dict]:
-    """Unwrap the {"d": "count*id*[…]"} envelope."""
     if isinstance(body, list):
         return body
     if not isinstance(body, dict):
@@ -712,7 +766,6 @@ def _parse_rps_response(body) -> list[dict]:
 def fetch_rps_trips(vehicles: list[str],
                     from_dt: datetime,
                     to_dt:   datetime) -> list[dict]:
-    """Call the RPS Report API in batches and concatenate all records."""
     out: list[dict] = []
     payload_base = {
         "from_time": from_dt.strftime("%Y-%m-%d 00:00:00"),
@@ -742,20 +795,16 @@ def fetch_rps_trips(vehicles: list[str],
 def main():
     ap = argparse.ArgumentParser(
         description="Backfill RPS trips into per-hub monthly MIS sheets.")
-    ap.add_argument("--days", type=int, default=10,
-                    help="Days back from now (default 10). Ignored with --from/--to/--month.")
-    ap.add_argument("--month", dest="month", default=None, metavar="YYYY-MM",
-                    help="Full calendar month, e.g. --month 2026-05 (May 2026).")
+    ap.add_argument("--days", type=int, default=10)
+    ap.add_argument("--month", dest="month", default=None, metavar="YYYY-MM")
     ap.add_argument("--from", dest="from_dt",
                     type=lambda s: parse_cli_dt(s, "from"), default=None)
     ap.add_argument("--to",   dest="to_dt",
                     type=lambda s: parse_cli_dt(s, "to"),   default=None)
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Fetch + plan, but do not write to sheets.")
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     if args.month:
-        # Parse YYYY-MM and expand to full first→last day of that month.
         try:
             month_dt = datetime.strptime(args.month.strip(), "%Y-%m")
         except ValueError:
@@ -768,7 +817,7 @@ def main():
         if args.from_dt >= args.to_dt:
             ap.error("--from must be earlier than --to")
         from_dt, to_dt = args.from_dt, args.to_dt
-        label = (f"{from_dt:%Y-%m-%d}  →  {to_dt:%Y-%m-%d}")
+        label = f"{from_dt:%Y-%m-%d}  →  {to_dt:%Y-%m-%d}"
     elif args.from_dt or args.to_dt:
         ap.error("--from and --to must be used together (or use --days / --month)")
     else:
@@ -781,11 +830,9 @@ def main():
           flush=True)
 
     if not HUB_TRIP_SHEETS:
-        print("[rps_scraper] HUB_TRIP_SHEETS is empty — fill in hub→sheet_id "
-              "pairs at the top of this script.", flush=True)
+        print("[rps_scraper] HUB_TRIP_SHEETS is empty.", flush=True)
         sys.exit(1)
 
-    # ── Load master lookups ───────────────────────────────────────────────────
     print("\n[rps_scraper] Loading master sheet lookups…", flush=True)
     client = gspread_client()
     master = client.open_by_key(MASTER_SHEET_ID)
@@ -796,9 +843,6 @@ def main():
     print(f"  Route SLA:   {len(sla_map)} routes with TAT hours",   flush=True)
     print(f"  Route Codes: {len(rc_map)} hub-name→code mappings",   flush=True)
 
-    # Canonicalize each vehicle's hub against HUB_TRIP_SHEETS so the routing
-    # is robust to casing / trailing-space differences in the master Vehicles
-    # tab.  Vehicles whose hub doesn't map to any configured hub are dropped.
     def _canonical_hub(raw: str) -> str | None:
         if not raw:
             return None
@@ -809,14 +853,13 @@ def main():
                    for vno, hub in vehicle_hub.items()
                    if (ch := _canonical_hub(hub))}
 
-    # Per-hub vehicle counts so misrouting becomes visible at a glance.
     hub_counts: dict[str, int] = {}
     for h in vehicle_hub.values():
         hub_counts[h] = hub_counts.get(h, 0) + 1
     target_vehicles = sorted(vehicle_hub.keys())
     if not target_vehicles:
-        print("[rps_scraper] No vehicles match any hub in HUB_TRIP_SHEETS — "
-              "check the master Vehicles tab.", flush=True)
+        print("[rps_scraper] No vehicles match any hub in HUB_TRIP_SHEETS.",
+              flush=True)
         sys.exit(1)
     print(f"  Targeting:   {len(target_vehicles)} vehicle(s) across "
           f"{len(HUB_TRIP_SHEETS)} hub(s):", flush=True)
@@ -824,26 +867,21 @@ def main():
         print(f"    {hub_name:<14} → {hub_counts.get(hub_name, 0):>3} vehicle(s)",
               flush=True)
 
-    # ── Fetch RPS records ─────────────────────────────────────────────────────
     print("\n[rps_scraper] Calling RPS Report API…", flush=True)
     records = fetch_rps_trips(target_vehicles, from_dt, to_dt)
     print(f"[rps_scraper] {len(records)} total records returned", flush=True)
     if not records:
         return
 
-    # ── Open one hub workbook at a time, dedup, append ───────────────────────
     total_added       = 0
     total_skipped     = 0
     total_unrouted    = 0
     total_endfilled   = 0
+    total_failed_rows = 0
+    skipped_workbooks: list[str] = []
 
-    # Cache per workbook: (spreadsheet, all_rps_set, backfill_map).
-    workbook_cache: dict[str, tuple[gspread.Spreadsheet,
-                                    set[str],
-                                    dict[str, tuple[str, int, bool, bool]]]] = {}
+    workbook_cache: dict[str, tuple] = {}
 
-    # Group records by destination workbook + tab.
-    # Key: (hub_name, tab_name)
     grouped: dict[tuple[str, str], list[dict]] = {}
     for rec in records:
         vno = first(rec, F_VEH).upper()
@@ -853,7 +891,7 @@ def main():
         if not hub or hub not in HUB_TRIP_SHEETS:
             total_unrouted += 1
             continue
-        start_dt = parse_dt(first(rec, F_START))
+        start_dt, _ = parse_dt_pair(first(rec, F_START), first(rec, F_END))
         if not start_dt:
             print(f"  [skip] {vno} RPS {first(rec, F_RPS) or '?'} — "
                   f"unparseable Start_Time", flush=True)
@@ -866,60 +904,56 @@ def main():
 
     for (hub, tab_name), recs in sorted(grouped.items()):
         sheet_id = HUB_TRIP_SHEETS[hub]
+        if sheet_id in skipped_workbooks:
+            continue
+
         if sheet_id not in workbook_cache:
-            ss = client.open_by_key(sheet_id)
-            all_rps, backfill = existing_rps_in_workbook(ss)
+            ss = _retry(client.open_by_key, sheet_id,
+                        _label=f"open_by_key({hub})")
+            try:
+                all_rps, backfill = existing_rps_in_workbook(ss)
+            except DedupReadError as exc:
+                # CRITICAL: refuse to write to this workbook on a failed
+                # dedup.  Otherwise we'd treat every API row as "new" and
+                # create thousands of duplicate rows.
+                print(f"[rps_scraper] SKIPPING {hub} workbook — dedup "
+                      f"unreadable ({exc}). Re-run later.", flush=True)
+                skipped_workbooks.append(sheet_id)
+                continue
             workbook_cache[sheet_id] = (ss, all_rps, backfill)
         ss, existing, backfill = workbook_cache[sheet_id]
 
-        # Classify each API record:
-        #   - not in existing  → new RPS, append as a full row
-        #   - in existing + in backfill → queue Start_Time/End_Time updates
-        #                                  independently (each field is filled
-        #                                  only when it is blank AND the API
-        #                                  has a value for it)
-        #   - in existing, nothing missing → skip
         fresh: list[dict] = []
-        end_updates: list[dict] = []   # [{tab, row, end_value, start_value}]
+        end_updates: list[dict] = []
         for rec in recs:
             rps = first(rec, F_RPS)
             if not rps:
                 continue
             key = _normalize_rps(rps)
             if key in existing:
-                # Row already exists — check independent fields.
                 if key in backfill:
                     tab_title, row_num, need_start, need_end = backfill[key]
-                    end_val   = None
-                    start_val = None
-                    if need_end:
-                        end_raw2 = first(rec, F_END)
-                        end_dt2  = parse_dt(end_raw2)
-                        if end_dt2:
-                            end_val = to_sheets_serial(end_dt2)
-                    if need_start:
-                        start_raw2 = first(rec, F_START)
-                        start_dt2  = parse_dt(start_raw2)
-                        if start_dt2:
-                            start_val = to_sheets_serial(start_dt2)
+                    start_dt2, end_dt2 = parse_dt_pair(
+                        first(rec, F_START), first(rec, F_END))
+                    end_val   = to_sheets_serial(end_dt2)   if (need_end   and end_dt2)   else None
+                    start_val = to_sheets_serial(start_dt2) if (need_start and start_dt2) else None
                     if end_val or start_val:
                         end_updates.append({
                             "tab":         tab_title,
                             "row":         row_num,
-                            "end_value":   end_val,    # None → don't touch col J
-                            "start_value": start_val,  # None → don't touch col I
+                            "end_value":   end_val,
+                            "start_value": start_val,
                         })
-                        backfill.pop(key, None)  # won't touch again this run
+                        backfill.pop(key, None)
                     else:
-                        total_skipped += 1  # API still has no data for missing fields
+                        total_skipped += 1
                 else:
                     total_skipped += 1
                 continue
-            existing.add(key)            # de-dupe within this batch too
+            existing.add(key)
             fresh.append(rec)
 
-        # Apply Start_Time / End_Time back-fills independently.
-        # Grouped by tab so each sheet gets one batch_update call.
+        # ── Atomic per-row back-fills (Start_Time and/or End_Time) ──────
         if end_updates and not args.dry_run:
             by_tab: dict[str, list[dict]] = {}
             for u in end_updates:
@@ -929,50 +963,42 @@ def main():
                     target_ws = ss.worksheet(tab_title)
                 except gspread.WorksheetNotFound:
                     continue
-                # Write only the cells that are actually missing.
-                batch: list[dict] = []
                 for u in ups:
-                    if u.get("end_value"):
-                        batch.append({"range": f"J{u['row']}",
-                                      "values": [[u["end_value"]]]})
-                    if u.get("start_value"):
-                        batch.append({"range": f"I{u['row']}",
-                                      "values": [[u["start_value"]]]})
-                # Write serial numbers as RAW — locale-independent.
-                if batch:
-                    target_ws.batch_update(batch,
-                                           value_input_option="RAW")
-                # Re-apply dd/MM/yyyy HH:mm:ss format on every written cell.
-                fmt_reqs: list[dict] = []
-                for u in ups:
-                    if u.get("end_value"):
-                        fmt_reqs.append({"repeatCell": {
-                            "range": {"sheetId": target_ws.id,
-                                      "startRowIndex": u["row"] - 1,
-                                      "endRowIndex":   u["row"],
-                                      "startColumnIndex": 9, "endColumnIndex": 10},
-                            "cell": {"userEnteredFormat": {
-                                "numberFormat": {"type": "DATE_TIME",
-                                                 "pattern": "dd/MM/yyyy HH:mm:ss"},
-                            }},
-                            "fields": "userEnteredFormat.numberFormat",
+                    # ONE batchUpdate per back-fill row: value + format land
+                    # together, or nothing for that row lands.
+                    cell_requests: list[dict] = []
+                    if u.get("end_value") is not None:
+                        cell_requests.append({"updateCells": {
+                            "rows": [{"values": [{
+                                "userEnteredValue": {"numberValue": float(u["end_value"])},
+                                "userEnteredFormat": {"numberFormat": _datetime_fmt()},
+                            }]}],
+                            "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+                            "start": {"sheetId": target_ws.id,
+                                      "rowIndex": u["row"] - 1,
+                                      "columnIndex": 9},
                         }})
-                    if u.get("start_value"):
-                        fmt_reqs.append({"repeatCell": {
-                            "range": {"sheetId": target_ws.id,
-                                      "startRowIndex": u["row"] - 1,
-                                      "endRowIndex":   u["row"],
-                                      "startColumnIndex": 8, "endColumnIndex": 9},
-                            "cell": {"userEnteredFormat": {
-                                "numberFormat": {"type": "DATE_TIME",
-                                                 "pattern": "dd/MM/yyyy HH:mm:ss"},
-                            }},
-                            "fields": "userEnteredFormat.numberFormat",
+                    if u.get("start_value") is not None:
+                        cell_requests.append({"updateCells": {
+                            "rows": [{"values": [{
+                                "userEnteredValue": {"numberValue": float(u["start_value"])},
+                                "userEnteredFormat": {"numberFormat": _datetime_fmt()},
+                            }]}],
+                            "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+                            "start": {"sheetId": target_ws.id,
+                                      "rowIndex": u["row"] - 1,
+                                      "columnIndex": 8},
                         }})
-                if fmt_reqs:
-                    ss.batch_update({"requests": fmt_reqs})
-                end_filled   = sum(1 for u in ups if u.get("end_value"))
-                start_filled = sum(1 for u in ups if u.get("start_value"))
+                    if cell_requests:
+                        try:
+                            _retry(ss.batch_update, {"requests": cell_requests},
+                                   _label=f"{tab_title}.backfill_row{u['row']}")
+                        except Exception as exc:
+                            print(f"  [backfill] {tab_title} row {u['row']}: "
+                                  f"FAILED ({exc}) — row left untouched",
+                                  flush=True)
+                end_filled   = sum(1 for u in ups if u.get("end_value")   is not None)
+                start_filled = sum(1 for u in ups if u.get("start_value") is not None)
                 parts = []
                 if end_filled:
                     parts.append(f"End_Time on {end_filled} row(s)")
@@ -984,16 +1010,6 @@ def main():
             total_endfilled += len(end_updates)
         elif end_updates and args.dry_run:
             total_endfilled += len(end_updates)
-            end_would   = sum(1 for u in end_updates if u.get("end_value"))
-            start_would = sum(1 for u in end_updates if u.get("start_value"))
-            parts = []
-            if end_would:
-                parts.append(f"End_Time on {end_would} row(s)")
-            if start_would:
-                parts.append(f"Start_Time on {start_would} row(s)")
-            if parts:
-                print(f"  [{hub}/{tab_name}] would back-fill "
-                      + ", ".join(parts), flush=True)
 
         if not fresh:
             if not end_updates:
@@ -1002,7 +1018,7 @@ def main():
             continue
 
         print(f"  [{hub}/{tab_name}] {len(fresh)} new / "
-              f"{len(end_updates)} end-filled / "
+              f"{len(end_updates)} backfilled / "
               f"{len(recs) - len(fresh) - len(end_updates)} duplicate(s)",
               flush=True)
 
@@ -1011,30 +1027,56 @@ def main():
             continue
 
         ws = get_or_create_trip_tab(ss, tab_name)
-        start_row = max(ws.row_count, len(ws.col_values(1))) + 1
-        # Grow if needed
+
+        # Find current last row.
+        col_a = _retry(ws.col_values, 1, _label=f"{tab_name}.col_values")
+        start_row = len(col_a) + 1
         needed = start_row + len(fresh) + 5
         if ws.row_count < needed:
-            ws.resize(rows=needed)
-        # Re-evaluate start_row from actual last filled row in col A
-        start_row = len(ws.col_values(1)) + 1
+            _retry(ws.resize, rows=needed, _label=f"{tab_name}.resize")
 
-        rows = [build_row(rec, vt_map, sla_map, rc_map, rc_items,
-                          start_row + i)
-                for i, rec in enumerate(fresh)]
-        ws.update(values=rows, range_name=f"A{start_row}",
-                  value_input_option="USER_ENTERED")
-        format_new_rows(ss, ws, start_row, len(rows))
+        # Re-check after resize.
+        col_a = _retry(ws.col_values, 1, _label=f"{tab_name}.col_values2")
+        start_row = len(col_a) + 1
+
+        # ── Atomic per-row insert ───────────────────────────────────────
+        # Each row's value + every per-cell format is wrapped into ONE
+        # spreadsheets.batchUpdate; if it fails (after retries), nothing
+        # for that row was written. We move on to the next row instead of
+        # aborting the entire workbook.
+        for offset, rec in enumerate(fresh):
+            row_num = start_row + offset
+            values, _sd, _ed = build_row_values(
+                rec, vt_map, sla_map, rc_map, rc_items, row_num)
+            try:
+                write_rows_atomically(ss, ws, row_num, [values])
+                total_added += 1
+            except Exception as exc:
+                total_failed_rows += 1
+                print(f"  [{hub}/{tab_name}] row {row_num} RPS "
+                      f"{first(rec, F_RPS) or '?'} FAILED ({exc}) — "
+                      f"row NOT inserted", flush=True)
+                # Remove from in-memory dedup set so a future re-run can
+                # retry this RPS instead of treating it as already-written.
+                key_fail = _normalize_rps(first(rec, F_RPS))
+                if key_fail:
+                    existing.discard(key_fail)
+                continue
+
         _delete_named_columns(ss, ws, {"_sort_key", "_sortKey", "sort_key"})
         _strip_extra_columns(ss, ws)
-        total_added += len(rows)
 
-    # Final cleanup pass — the destination workbook's bound Apps Script may
-    # re-add '_sort_key' AFTER we strip it during the write phase. Sweep all
-    # touched workbooks/tabs once more before we exit.
+    # Final foreign-column sweep (defensive — bound Apps Scripts re-add it).
     print("\n[rps_scraper] Final foreign-column sweep…", flush=True)
-    for sheet_id, (ss, _, _) in workbook_cache.items():
-        for ws in ss.worksheets():
+    for sheet_id, cached in workbook_cache.items():
+        ss = cached[0]
+        try:
+            worksheets = _retry(ss.worksheets, _label=f"{sheet_id}.worksheets")
+        except Exception as exc:
+            print(f"  [strip] {sheet_id}: worksheets() failed ({exc})",
+                  flush=True)
+            continue
+        for ws in worksheets:
             if not ws.title.endswith("_MIS"):
                 continue
             _delete_named_columns(ss, ws,
@@ -1042,8 +1084,10 @@ def main():
             _strip_extra_columns(ss, ws)
 
     print(f"\n[rps_scraper] Done. Added: {total_added}  "
-          f"End_Time back-filled: {total_endfilled}  "
-          f"Skipped: {total_skipped}", flush=True)
+          f"Back-filled: {total_endfilled}  "
+          f"Skipped(dup): {total_skipped}  "
+          f"Failed rows: {total_failed_rows}  "
+          f"Workbooks skipped: {len(skipped_workbooks)}", flush=True)
 
 
 if __name__ == "__main__":
