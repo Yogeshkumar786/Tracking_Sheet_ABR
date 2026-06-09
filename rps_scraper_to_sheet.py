@@ -95,7 +95,7 @@ TRIP_HEADERS = [
     "Route", "Route_Code", "Route_TAT",
     "Start_Time", "End_Time",
     "Transit_Time", "Extra_Touching_Time", "Actual_Transit_Time",
-    "Delay_Hours", "Status",
+    "Delay_Hours", "Late Reason", "Status",
     "Given_Advance", "Given_Diesel", "Diesel_Amount",
     "Given_Toll", "Given_Challan", "Extra_Diesel", "Maintainance",
     "Close_Status",
@@ -661,6 +661,7 @@ def build_row_values(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
         "",
         f"=IF(L{r}=\"\",K{r},K{r}-L{r})",
         f"=IF(M{r}>H{r},M{r}-H{r},0)",
+        "",  # Late Reason (free text)
         f'=IF(N{r}=0,"On Time","Delayed")',
         "", "", "", "", "", "", "",
         False,
@@ -679,7 +680,8 @@ def _row_to_cell_data(row_values: list) -> list[dict]:
         10 K Transit_Time          Duration  (formula)
         12 M Actual_Transit_Time   Duration  (formula)
         13 N Delay_Hours           Duration  (formula)
-        22 W Close_Status          checkbox  (handled via dataValidation)
+        14 O Late Reason          (free text)
+        23 X Close_Status          checkbox  (handled via dataValidation)
     """
     duration_cols = {7, 10, 12, 13}
     datetime_cols = {8, 9}
