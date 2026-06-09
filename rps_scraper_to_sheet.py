@@ -530,6 +530,13 @@ def _normalize_rps(v) -> str:
     return s
 
 
+def _rps_sheet_value(v):
+    key = _normalize_rps(v)
+    if key.isdigit():
+        return int(key)
+    return key
+
+
 class DedupReadError(Exception):
     """Raised when we couldn't reliably read existing RPS rows. The caller
     MUST skip writes to that workbook — otherwise we'd duplicate everything.
@@ -616,7 +623,7 @@ def build_row_values(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
                      rc_items: list[tuple[str, str]],
                      row_num: int) -> tuple[list, datetime | None, datetime | None]:
     """Return (values_for_row, start_dt, end_dt). row_num is 1-based."""
-    rps    = first(rec, F_RPS)
+    rps    = _rps_sheet_value(first(rec, F_RPS))
     vno    = first(rec, F_VEH).upper()
     vtype  = first(rec, F_VTYPE) or vt_map.get(vno, "")
     driver = first(rec, F_DRIVER_NAME)
