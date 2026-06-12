@@ -97,10 +97,16 @@ TRIP_HEADERS = [
     "Transit_Time", "Extra_Touching_Time", "Actual_Transit_Time",
     "Delay_Hours", "Late Reason", "Status",
     "Given_Advance", "Given_Diesel", "Diesel_Amount",
-    "Given_Toll", "Given_Challan", "Extra_Diesel", "Maintainance",
+    "Given_Toll", "Given_Challan", "Extra_Diesel", "Extra_Diesel_Amount",
+    "Maintainance",
     "Close_Status",
 ]
 TRIP_NCOLS = len(TRIP_HEADERS)
+EXTRA_DIESEL_AMOUNT_COL = TRIP_HEADERS.index("Extra_Diesel_Amount")
+
+OLD_TRIP_HEADERS = [
+    h for h in TRIP_HEADERS if h != "Extra_Diesel_Amount"
+]
 
 HEADER_COLOR = {"red": 0.043, "green": 0.329, "blue": 0.580}
 WHITE        = {"red": 1.0,   "green": 1.0,   "blue": 1.0}
@@ -467,14 +473,49 @@ def _strip_extra_columns(ss, ws):
         print(f"  [strip] {ws.title}: column trim skipped ({exc})", flush=True)
 
 
+def _ensure_trip_columns_and_header(ss, ws, tab_name: str) -> None:
+    header = _retry(ws.row_values, 1, _label=f"{tab_name}.row_values")
+    if header == TRIP_HEADERS:
+        return
+
+    if header == OLD_TRIP_HEADERS:
+        _retry(ss.batch_update, {"requests": [{"insertDimension": {
+            "range": {"sheetId": ws.id,
+                      "dimension": "COLUMNS",
+                      "startIndex": EXTRA_DIESEL_AMOUNT_COL,
+                      "endIndex": EXTRA_DIESEL_AMOUNT_COL + 1},
+            "inheritFromBefore": True,
+        }}]}, _label=f"{tab_name}.insert_extra_diesel_amount")
+        print(f"  [migrate] {tab_name}: inserted Extra_Diesel_Amount column",
+              flush=True)
+    elif ws.col_count < TRIP_NCOLS:
+        _retry(ws.resize, cols=TRIP_NCOLS, _label=f"{tab_name}.resize_cols")
+
+    _retry(ws.update, values=[TRIP_HEADERS], range_name="A1",
+           value_input_option="RAW",
+           _label=f"{tab_name}.update_header")
+
+
+def _currency_fmt() -> dict:
+    return {"type": "CURRENCY", "pattern": '"₹"#,##0.00'}
+
+
+def _format_extra_diesel_amount_column(ss, ws, tab_name: str) -> None:
+    _retry(ss.batch_update, {"requests": [{"repeatCell": {
+        "range": {"sheetId": ws.id,
+                  "startRowIndex": 1,
+                  "startColumnIndex": EXTRA_DIESEL_AMOUNT_COL,
+                  "endColumnIndex": EXTRA_DIESEL_AMOUNT_COL + 1},
+        "cell": {"userEnteredFormat": {"numberFormat": _currency_fmt()}},
+        "fields": "userEnteredFormat.numberFormat",
+    }}]}, _label=f"{tab_name}.format_extra_diesel_amount")
+
+
 def get_or_create_trip_tab(ss, tab_name: str):
     try:
         ws = ss.worksheet(tab_name)
-        header = _retry(ws.row_values, 1, _label=f"{tab_name}.row_values")
-        if header != TRIP_HEADERS:
-            _retry(ws.update, values=[TRIP_HEADERS], range_name="A1",
-                   value_input_option="RAW",
-                   _label=f"{tab_name}.update_header")
+        _ensure_trip_columns_and_header(ss, ws, tab_name)
+        _format_extra_diesel_amount_column(ss, ws, tab_name)
         _delete_named_columns(ss, ws, {"_sort_key", "_sortKey", "sort_key"})
         _strip_extra_columns(ss, ws)
         return ws
@@ -510,6 +551,14 @@ def get_or_create_trip_tab(ss, tab_name: str):
                       "startColumnIndex": TRIP_NCOLS - 1,
                       "endColumnIndex": TRIP_NCOLS},
             "rule": {"condition": {"type": "BOOLEAN"}, "strict": True},
+        }},
+        {"repeatCell": {
+            "range": {"sheetId": ws.id,
+                      "startRowIndex": 1,
+                      "startColumnIndex": EXTRA_DIESEL_AMOUNT_COL,
+                      "endColumnIndex": EXTRA_DIESEL_AMOUNT_COL + 1},
+            "cell": {"userEnteredFormat": {"numberFormat": _currency_fmt()}},
+            "fields": "userEnteredFormat.numberFormat",
         }},
     ]}, _label=f"{tab_name}.init_format")
     _strip_extra_columns(ss, ws)
@@ -663,7 +712,7 @@ def build_row_values(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
         f"=IF(M{r}>H{r},M{r}-H{r},0)",
         "",  # Late Reason (free text)
         f'=IF(N{r}=0,"On Time","Delayed")',
-        "", "", "", "", "", "", "",
+        "", "", "", "", "", "", "", "",
         False,
     ], start_dt, end_dt
 
@@ -680,11 +729,13 @@ def _row_to_cell_data(row_values: list) -> list[dict]:
         10 K Transit_Time          Duration  (formula)
         12 M Actual_Transit_Time   Duration  (formula)
         13 N Delay_Hours           Duration  (formula)
-        14 O Late Reason          (free text)
-        23 X Close_Status          checkbox  (handled via dataValidation)
+        14 O Late Reason           (free text)
+        22 W Extra_Diesel_Amount   Currency
+        24 Y Close_Status          checkbox  (handled via dataValidation)
     """
     duration_cols = {7, 10, 12, 13}
     datetime_cols = {8, 9}
+    currency_cols = {EXTRA_DIESEL_AMOUNT_COL}
     out: list[dict] = []
     for ci, v in enumerate(row_values):
         cd: dict = {}
@@ -705,6 +756,8 @@ def _row_to_cell_data(row_values: list) -> list[dict]:
             fmt_obj = _datetime_fmt()
         elif ci in duration_cols:
             fmt_obj = _duration_fmt()
+        elif ci in currency_cols:
+            fmt_obj = _currency_fmt()
         if fmt_obj is not None:
             cd["userEnteredFormat"] = {"numberFormat": fmt_obj}
         out.append(cd)
@@ -731,7 +784,7 @@ def write_rows_atomically(ss, ws, start_row: int, rows: list[list]) -> None:
                        "rowIndex":    start_row - 1,
                        "columnIndex": 0},
         }},
-        # Re-apply checkbox validation on the just-written W column.
+        # Re-apply checkbox validation on the just-written Close_Status column.
         {"setDataValidation": {
             "range": {"sheetId":          ws.id,
                       "startRowIndex":    start_row - 1,
@@ -1088,6 +1141,8 @@ def main():
         for ws in worksheets:
             if not ws.title.endswith("_MIS"):
                 continue
+            _ensure_trip_columns_and_header(ss, ws, ws.title)
+            _format_extra_diesel_amount_column(ss, ws, ws.title)
             _delete_named_columns(ss, ws,
                                   {"_sort_key", "_sortKey", "sort_key"})
             _strip_extra_columns(ss, ws)
