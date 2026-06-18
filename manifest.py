@@ -470,7 +470,7 @@ def sync_pois_tab(sheet, poi_by_name: dict):
 
 
 TRACKING_HEADERS = [
-    "vehicle", "driver", "status", "speed_kmh",
+    "vehicle", "from", "to", "driver", "status", "speed_kmh",
     "current_location", "maps_link", "last_seen", "latitude", "longitude",
 ]
 
@@ -489,7 +489,7 @@ def resolve_location(lat, lon, pois: list) -> str:
     for poi in pois:
         if inside(poi, lat, lon, slack_m=200.0):
             return poi["name"]
-    return f"{lat:.5f}, {lon:.5f}"
+    return "In Transit"
 
 
 def maps_hyperlink(lat, lon, label: str) -> str:
@@ -839,13 +839,16 @@ def main() -> int:
 
         # Live location
         loc = fetch_vehicle_location(client, veh["id"])
+        tracking_entry: dict | None = None
         if loc:
             lat      = loc.get("latitude")
             lon      = loc.get("longitude")
             spd      = loc.get("speed")
             location = resolve_location(lat, lon, pois)
-            tracking_rows.append({
+            tracking_entry = {
                 "vehicle":          veh.get("licensePlate") or v_key,
+                "from":             "",
+                "to":               "",
                 "driver":           loc.get("driverName") or "",
                 "status":           _STATUS_LABEL.get(loc.get("status", ""), loc.get("status", "")),
                 "speed_kmh":        round(spd, 1) if spd is not None else "",
@@ -854,7 +857,8 @@ def main() -> int:
                 "last_seen":        loc.get("timeStamp") or "",
                 "latitude":         lat if lat is not None else "",
                 "longitude":        lon if lon is not None else "",
-            })
+            }
+            tracking_rows.append(tracking_entry)
 
         try:
             trips = fetch_trips(client, veh["id"], frm_dt, to_dt)
@@ -902,6 +906,15 @@ def main() -> int:
         intra = len(journeys) - kept_undirected
         print(f"[vehicle] {v_key:14}  {len(trips)} legs -> {len(journeys)} transitions, "
               f"{len(kept)} kept ({intra} intra-cluster, {wrong_dir} wrong-direction)")
+
+        # Fill FROM/TO in tracking entry from the active (in-progress) journey
+        if tracking_entry and journeys:
+            active = next(
+                (j for j in reversed(journeys) if j["src"] is not None and j["arrived_at"] is None),
+                journeys[-1],
+            )
+            tracking_entry["from"] = active["src"]["name"] if active["src"] else ""
+            tracking_entry["to"]   = active["dst"]["name"] if active["dst"] else ""
 
     upsert_manifest_tabs(sheet, all_rows)
 
