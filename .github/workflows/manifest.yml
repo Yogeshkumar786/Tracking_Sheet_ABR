@@ -32,6 +32,6 @@ jobs:
           FLEETX_USERNAME:    ${{ secrets.FLEETX_USERNAME }}
           FLEETX_PASSWORD:    ${{ secrets.FLEETX_PASSWORD }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          SHEET_ID:           ${{ secrets.SHEET_ID }}
+          SHEET_ID:           ${{ secrets.MANIFEST_SHEET_ID }}
           FLEETX_BACKFILL_FROM: ${{ github.event.inputs.backfill_from }}
         run: python manifest.py
