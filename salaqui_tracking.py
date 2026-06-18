@@ -270,27 +270,22 @@ def main() -> None:
     pois = read_pois_from_sheet(ss_src)
     print(f"  {len(pois)} POIs loaded")
 
-    print("[routes] Reading Routes tab...")
+    print("[routes] Reading Routes tab for vehicle list...")
     routes = read_routes_from_sheet(ss_src)
-    target_routes = [
-        r for r in routes
+    enabled_plates = {
+        str(r.get("vehicle", "")).upper().strip()
+        for r in routes
         if str(r.get("enabled", "yes")).lower() not in ("no", "false", "0")
-        and _is_shambhu_salaqui_route(str(r.get("from", "")), str(r.get("to", "")))
-    ]
-    print(f"  {len(target_routes)} Shambhu↔Salaqui route(s) configured")
-
-    if not target_routes:
-        print("  No matching routes — check Routes tab has 'from'=Shambhu and 'to'=Salaqui rows.")
+        and str(r.get("vehicle", "")).strip()
+    }
+    print(f"  {len(enabled_plates)} enabled vehicle(s) in Routes tab")
 
     print("[vehicles] Fetching vehicle list from Fleetx...")
     by_plate = get_all_vehicles(client)
 
-    # Collect vehicle IDs and plates for all target routes
+    # Match Routes vehicles to Fleetx IDs
     vehicles_to_track: list[tuple[str, int]] = []
-    for route in target_routes:
-        plate = str(route.get("vehicle", "")).upper().strip()
-        if not plate:
-            continue
+    for plate in sorted(enabled_plates):
         veh = by_plate.get(plate)
         if not veh:
             for p, v in by_plate.items():
@@ -298,20 +293,11 @@ def main() -> None:
                     veh = v
                     break
         if not veh:
-            print(f"  [warn] vehicle '{plate}' not found in Fleetx")
+            print(f"  [warn] '{plate}' not found in Fleetx — skipping")
             continue
         vehicles_to_track.append((plate, int(veh["id"])))
 
-    # De-duplicate plates
-    seen: set[str] = set()
-    unique: list[tuple[str, int]] = []
-    for plate, vid in vehicles_to_track:
-        if plate not in seen:
-            seen.add(plate)
-            unique.append((plate, vid))
-    vehicles_to_track = unique
-
-    print(f"  {len(vehicles_to_track)} unique vehicle(s) to track")
+    print(f"  {len(vehicles_to_track)} vehicle(s) to scan for Shambhu↔Salaqui trips")
 
     # Build report rows
     rows: list[list] = []
@@ -323,7 +309,7 @@ def main() -> None:
 
         dep_ts    = ''
         arr_ts    = ''
-        status    = 'NO ACTIVE TRIP'
+        status    = ''
         src_name  = 'SAMBHU'
         dst_name  = 'SALAQUI'
 
@@ -391,14 +377,18 @@ def main() -> None:
         elif active_trip:
             status = 'IN TRANSIT'
 
+        # Only include vehicles that have (or had) a Shambhu↔Salaqui trip
+        if not active_trip and not status:
+            continue
+
         rows.append([
-            '',            # S.No — filled by formula below
+            '',            # S.No — filled below
             plate,
             src_name,
             dst_name,
             dep_ts,
             arr_ts,
-            status,
+            status or 'IN TRANSIT',
             '',            # REMARK — manual
         ])
 
