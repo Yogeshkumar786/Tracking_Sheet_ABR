@@ -643,16 +643,14 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
     vehicle_order:   list[str]        = []
     seen_vehicles:   set[str]         = set()
 
-    in_orphan_block = False
     for raw in existing_raw[1:]:
         if not any(raw):
-            in_orphan_block = True
-            continue
+            continue  # blank separator row — skip, do not trigger orphan mode
         vehicle    = raw[1] if len(raw) > 1 else ""
         start_date = raw[6] if len(raw) > 6 else ""
         has_key    = bool(vehicle and start_date)
 
-        if in_orphan_block or not has_key:
+        if not has_key:
             orphan_rows.append((list(raw) + [""] * len(MANIFEST_HEADERS))[:len(MANIFEST_HEADERS)])
             continue
 
