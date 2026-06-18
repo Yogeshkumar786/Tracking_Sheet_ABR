@@ -28,8 +28,12 @@ TRACKING_SHEET_ID = '13fo7UntbmwSZCOidVUA-kQoZmyA8fKvDS5s6PPh9qE0'
 MANIFEST_SHEET_ID = '10IOgyNyxBE2kcMJ1GwywKEXL4mc4hmTVIItjEtsFn2o'  # manifest source
 TAB_NAME          = 'Salaqui Tracking'
 
-FROM_KEYWORDS = ['shambhu', 'sambhu']
-TO_KEYWORDS   = ['salaqui', 'selaqui', 'selaque']
+SHAMBHU_KEYWORDS = ['shambhu', 'sambhu']
+SALAQUI_KEYWORDS = ['salaqui', 'selaqui', 'selaque']
+
+# Both directions: Shambhu→Salaqui and Salaqui→Shambhu
+FROM_KEYWORDS = SHAMBHU_KEYWORDS + SALAQUI_KEYWORDS
+TO_KEYWORDS   = SHAMBHU_KEYWORDS + SALAQUI_KEYWORDS
 
 HEADERS = [
     'S.No', 'Vehicle No', 'From', 'TO',
@@ -160,6 +164,14 @@ def kw_match(text: str, keywords: list[str]) -> bool:
     t = text.lower()
     return any(k in t for k in keywords)
 
+def _is_shambhu_salaqui_route(frm: str, to: str) -> bool:
+    """True for both Shambhu→Salaqui and Salaqui→Shambhu, but not same-to-same."""
+    frm_is_s = kw_match(frm, SHAMBHU_KEYWORDS)
+    frm_is_q = kw_match(frm, SALAQUI_KEYWORDS)
+    to_is_s  = kw_match(to,  SHAMBHU_KEYWORDS)
+    to_is_q  = kw_match(to,  SALAQUI_KEYWORDS)
+    return (frm_is_s and to_is_q) or (frm_is_q and to_is_s)
+
 def fmt_ts(ms: int | None) -> str:
     if not ms:
         return ''
@@ -263,10 +275,9 @@ def main() -> None:
     target_routes = [
         r for r in routes
         if str(r.get("enabled", "yes")).lower() not in ("no", "false", "0")
-        and kw_match(str(r.get("from", "")), FROM_KEYWORDS)
-        and kw_match(str(r.get("to",   "")), TO_KEYWORDS)
+        and _is_shambhu_salaqui_route(str(r.get("from", "")), str(r.get("to", "")))
     ]
-    print(f"  {len(target_routes)} Shambhu→Salaqui route(s) configured")
+    print(f"  {len(target_routes)} Shambhu↔Salaqui route(s) configured")
 
     if not target_routes:
         print("  No matching routes — check Routes tab has 'from'=Shambhu and 'to'=Salaqui rows.")
@@ -316,33 +327,44 @@ def main() -> None:
         src_name  = 'SAMBHU'
         dst_name  = 'SALAQUI'
 
-        # Find the most recent trip leg starting from Shambhu area
-        active_trip = None
+        # Find the most recent trip leg on either Shambhu↔Salaqui direction
+        active_trip    = None
+        dest_keywords  = []
         for t in sorted(trips, key=lambda x: x.get("sDate", 0), reverse=True):
             s_name = (t.get("startAddress") or t.get("sName") or "").lower()
-            e_name = (t.get("endAddress")   or t.get("eName") or "").lower()
             s_lat  = t.get("sLat") or t.get("startLat")
             s_lon  = t.get("sLon") or t.get("startLon")
 
-            # Match by address name OR by POI geofence
-            from_match = (
-                kw_match(s_name, FROM_KEYWORDS)
-                or (s_lat and s_lon and any(
-                    kw_match(p["name"], FROM_KEYWORDS)
-                    and haversine_m(p["latitude"], p["longitude"], float(s_lat), float(s_lon)) < (p["radius"] + 500)
-                    for p in pois
-                ))
-            )
-            if not from_match:
+            src_kws = None
+            dst_kws = None
+            if kw_match(s_name, SHAMBHU_KEYWORDS):
+                src_kws, dst_kws = SHAMBHU_KEYWORDS, SALAQUI_KEYWORDS
+            elif kw_match(s_name, SALAQUI_KEYWORDS):
+                src_kws, dst_kws = SALAQUI_KEYWORDS, SHAMBHU_KEYWORDS
+            elif s_lat and s_lon:
+                # fallback: match start coords against POIs
+                for p in pois:
+                    try:
+                        if haversine_m(p["latitude"], p["longitude"], float(s_lat), float(s_lon)) < (p["radius"] + 500):
+                            if kw_match(p["name"], SHAMBHU_KEYWORDS):
+                                src_kws, dst_kws = SHAMBHU_KEYWORDS, SALAQUI_KEYWORDS
+                            elif kw_match(p["name"], SALAQUI_KEYWORDS):
+                                src_kws, dst_kws = SALAQUI_KEYWORDS, SHAMBHU_KEYWORDS
+                            break
+                    except (TypeError, ValueError):
+                        continue
+
+            if not src_kws:
                 continue
 
-            active_trip = t
+            active_trip   = t
+            dest_keywords = dst_kws
             dep_ts  = fmt_ts(t.get("sDate"))
             arr_ts  = fmt_ts(t.get("eDate")) if not t.get("haltTrip") and t.get("eDate") else ''
-            s_n = t.get("startAddress") or t.get("sName") or "SAMBHU"
-            e_n = t.get("endAddress")   or t.get("eName") or "SALAQUI"
-            src_name = s_n.upper() if s_n else "SAMBHU"
-            dst_name = e_n.upper() if e_n else "SALAQUI"
+            s_n = t.get("startAddress") or t.get("sName") or ("SAMBHU" if src_kws == SHAMBHU_KEYWORDS else "SALAQUI")
+            e_n = t.get("endAddress")   or t.get("eName") or ("SALAQUI" if dst_kws == SALAQUI_KEYWORDS else "SAMBHU")
+            src_name = s_n.upper()
+            dst_name = e_n.upper()
             break
 
         # Determine current status from live location
@@ -354,7 +376,8 @@ def main() -> None:
                 poi = nearest_poi(pois, lat, lon, max_m=5000)
                 if poi:
                     pname = poi["name"].upper()
-                    if kw_match(pname, TO_KEYWORDS) or kw_match(pname, ['salaqui', 'selaqui', 'selaque']):
+                    arrived = dest_keywords and kw_match(pname, dest_keywords)
+                    if arrived:
                         status = f'ARRIVED - {pname}'
                         if not arr_ts:
                             ts = live.get("time") or live.get("timestamp")
