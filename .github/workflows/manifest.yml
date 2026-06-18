@@ -1,0 +1,37 @@
+name: Manifest Scraper
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # every 4 hours
+  workflow_dispatch:         # run manually from Actions tab
+    inputs:
+      backfill_from:
+        description: "Backfill from date (YYYY-MM-DD). Leave empty for rolling 7-day window."
+        required: false
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run manifest scraper
+        env:
+          FLEETX_USERNAME:    ${{ secrets.FLEETX_USERNAME }}
+          FLEETX_PASSWORD:    ${{ secrets.FLEETX_PASSWORD }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_ID:           ${{ secrets.SHEET_ID }}
+          FLEETX_BACKFILL_FROM: ${{ github.event.inputs.backfill_from }}
+        run: python manifest.py
