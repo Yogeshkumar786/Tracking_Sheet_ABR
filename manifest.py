@@ -5,7 +5,7 @@ Secrets required (GitHub repo Settings -> Secrets -> Actions):
     FLEETX_USERNAME      Fleetx login email
     FLEETX_PASSWORD      Fleetx login password
     GOOGLE_CREDENTIALS   Full JSON of the service-account key file
-    Manifest_SHEET_ID             Google Sheet ID (long string in the URL)
+    MANIFEST_SHEET_ID             Google Sheet ID (long string in the URL)
 
 Optional env vars:
     FLEETX_LOOKBACK_DAYS   Days to look back (default 7)
@@ -52,7 +52,7 @@ BACKFILL_FROM   = os.environ.get("FLEETX_BACKFILL_FROM")
 ROUTES_TAB      = os.environ.get("ROUTES_TAB", "Routes")
 POIS_TAB        = os.environ.get("POIS_TAB", "POIs")
 TRACKING_TAB    = os.environ.get("TRACKING_TAB", "Live Tracking")
-Manifest_Manifest_SHEET_ID        = os.environ.get("Manifest_SHEET_ID")
+Manifest_MANIFEST_SHEET_ID        = os.environ.get("MANIFEST_SHEET_ID")
 
 MANIFEST_HEADERS = [
     "S.NO", "VEHICLE NO.", "VEHICLE TYPE", "MANIFEST NO",
@@ -382,8 +382,8 @@ def matches_direction(j: dict, allowed_directed: set[tuple[int, int]]) -> bool:
 # Google Sheet helpers
 # ---------------------------------------------------------------------------
 def open_sheet():
-    if not Manifest_SHEET_ID:
-        sys.exit("Manifest_SHEET_ID env var is required.")
+    if not MANIFEST_SHEET_ID:
+        sys.exit("MANIFEST_SHEET_ID env var is required.")
 
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if creds_json:
@@ -401,7 +401,7 @@ def open_sheet():
         )
         gc = gspread.service_account(filename=creds_path)
 
-    return gc.open_by_key(Manifest_SHEET_ID)
+    return gc.open_by_key(MANIFEST_SHEET_ID)
 
 
 def read_routes(sheet) -> list[dict]:
@@ -758,15 +758,15 @@ def parse_args():
     ap.add_argument("--days", type=int,
                     help=f"Rolling lookback in days (default {LOOKBACK_DAYS})")
     ap.add_argument("--sheet-id",
-                    help="Google Sheet ID (overrides Manifest_SHEET_ID env var)")
+                    help="Google Sheet ID (overrides MANIFEST_SHEET_ID env var)")
     return ap.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    global Manifest_SHEET_ID
-    if args.Manifest_SHEET_ID:
-        Manifest_SHEET_ID = args.Manifest_SHEET_ID
+    global MANIFEST_SHEET_ID
+    if args.MANIFEST_SHEET_ID:
+        MANIFEST_SHEET_ID = args.MANIFEST_SHEET_ID
 
     print(f"[run] {datetime.now(IST):%Y-%m-%d %H:%M:%S IST}")
     sheet  = open_sheet()
