@@ -172,10 +172,18 @@ def _is_shambhu_salaqui_route(frm: str, to: str) -> bool:
     to_is_q  = kw_match(to,  SALAQUI_KEYWORDS)
     return (frm_is_s and to_is_q) or (frm_is_q and to_is_s)
 
-def fmt_ts(ms: int | None) -> str:
-    if not ms:
+def fmt_ts(v) -> str:
+    if not v:
         return ''
-    return datetime.fromtimestamp(ms / 1000, tz=IST).strftime('%Y-%m-%d %H:%M')
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v / 1000, tz=IST).strftime('%Y-%m-%d %H:%M')
+    s = str(v).strip()
+    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S.%f'):
+        try:
+            return datetime.strptime(s[:26], fmt).strftime('%Y-%m-%d %H:%M')
+        except ValueError:
+            continue
+    return s[:16]   # fallback: return as-is trimmed
 
 def open_sheet(sheet_id: str):
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
