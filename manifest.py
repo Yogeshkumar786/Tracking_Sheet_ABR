@@ -382,7 +382,7 @@ def matches_direction(j: dict, allowed_directed: set[tuple[int, int]]) -> bool:
 # Google Sheet helpers
 # ---------------------------------------------------------------------------
 def open_sheet():
-    if not Manifest_SHEET_ID:
+    if not SHEET_ID:
         sys.exit("Manifest_SHEET_ID env var is required.")
 
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
@@ -401,7 +401,7 @@ def open_sheet():
         )
         gc = gspread.service_account(filename=creds_path)
 
-    return gc.open_by_key(Manifest_SHEET_ID)
+    return gc.open_by_key(SHEET_ID)
 
 
 def read_routes(sheet) -> list[dict]:
