@@ -52,7 +52,7 @@ BACKFILL_FROM   = os.environ.get("FLEETX_BACKFILL_FROM")
 ROUTES_TAB      = os.environ.get("ROUTES_TAB", "Routes")
 POIS_TAB        = os.environ.get("POIS_TAB", "POIs")
 TRACKING_TAB    = os.environ.get("TRACKING_TAB", "Live Tracking")
-SHEET_ID        = os.environ.get("Manifest_SHEET_ID")
+SHEET_ID        = os.environ.get("MANIFEST_SHEET_ID")
 
 MANIFEST_HEADERS = [
     "S.NO", "VEHICLE NO.", "VEHICLE TYPE", "MANIFEST NO",
@@ -383,7 +383,7 @@ def matches_direction(j: dict, allowed_directed: set[tuple[int, int]]) -> bool:
 # ---------------------------------------------------------------------------
 def open_sheet():
     if not SHEET_ID:
-        sys.exit("Manifest_SHEET_ID env var is required.")
+        sys.exit("MANIFEST_SHEET_ID env var is required.")
 
     creds_json = os.environ.get("GOOGLE_CREDENTIALS")
     if creds_json:
