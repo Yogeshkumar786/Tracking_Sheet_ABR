@@ -359,7 +359,21 @@ def find_vehicle_journeys(trips: list, watched_pois: list) -> list:
     elif current is not None:
         out.append({"src": current, "dst": None,
                     "departed_at": current_since, "arrived_at": None, "legs": []})
-    return out
+
+    # GPS jitter at the origin POI can cause multiple spurious journey starts
+    # that all share the same src, dst, and arrived_at.  Keep only the earliest.
+    dedup: dict = {}
+    for j in out:
+        src_id  = j["src"]["id"] if j["src"] else None
+        dst_id  = j["dst"]["id"] if j["dst"] else None
+        arr     = j["arrived_at"]
+        dk      = (src_id, dst_id, arr)
+        if arr and dk in dedup:
+            if (j["departed_at"] or "") < (dedup[dk]["departed_at"] or ""):
+                dedup[dk]["departed_at"] = j["departed_at"]
+        else:
+            dedup[dk] = j
+    return list(dedup.values())
 
 
 def journey_to_row(j: dict, vehicle_plate: str) -> dict:
