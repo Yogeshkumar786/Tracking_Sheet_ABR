@@ -360,15 +360,16 @@ def find_vehicle_journeys(trips: list, watched_pois: list) -> list:
         out.append({"src": current, "dst": None,
                     "departed_at": current_since, "arrived_at": None, "legs": []})
 
-    # GPS jitter at the origin POI can cause multiple spurious journey starts
-    # that all share the same src, dst, and arrived_at.  Keep only the earliest.
+    # GPS jitter at the origin POI can create multiple spurious journey starts
+    # that all share the same src, dst, and arrival minute.  Keep only the
+    # journey with the earliest departed_at.
     dedup: dict = {}
     for j in out:
         src_id  = j["src"]["id"] if j["src"] else None
         dst_id  = j["dst"]["id"] if j["dst"] else None
-        arr     = j["arrived_at"]
-        dk      = (src_id, dst_id, arr)
-        if arr and dk in dedup:
+        arr_min = str(j["arrived_at"] or "")[:16]   # truncate to "YYYY-MM-DD HH:MM"
+        dk      = (src_id, dst_id, arr_min)
+        if arr_min and dk in dedup:
             if (j["departed_at"] or "") < (dedup[dk]["departed_at"] or ""):
                 dedup[dk]["departed_at"] = j["departed_at"]
         else:
