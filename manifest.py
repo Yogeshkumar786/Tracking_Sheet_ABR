@@ -335,9 +335,10 @@ def find_vehicle_journeys(trips: list, watched_pois: list) -> list:
             # Use the last confirmed timestamp at source POI (eDate of prev trip)
             # rather than when the vehicle first arrived there.  This avoids
             # recording a departure time from hours/days ago when GPS jitter kept
-            # re-entering the geofence.
+            # re-entering the geofence.  Fall back to t["sDate"] if prev_e_date
+            # is None (e.g. halt trip without an eDate field).
             if current is not None and prev_e_p is not None and prev_e_p["id"] == src["id"]:
-                departed_at = prev_e_date
+                departed_at = prev_e_date or t["sDate"]
             else:
                 departed_at = t["sDate"]
             saved_since = current_since
@@ -630,13 +631,19 @@ def save_meta(ws, meta: dict) -> None:
 
 
 def upsert_manifest_tabs(sheet, all_rows: list[dict]) -> None:
+    print(f"[debug] upsert_manifest_tabs: {len(all_rows)} total rows")
+    skipped = 0
     by_tab: dict[str, list[dict]] = {}
     for r in all_rows:
         if not r.get("start_date") or not r.get("to") or not r.get("end_date"):
+            skipped += 1
+            if skipped <= 3:
+                print(f"[debug] filtered row: start={r.get('start_date')!r} to={r.get('to')!r} end={r.get('end_date')!r}")
             continue
         tab = _manifest_tab_name(r["start_date"], r["to"])
         if tab:
             by_tab.setdefault(tab, []).append(r)
+    print(f"[debug] {skipped} rows filtered, {sum(len(v) for v in by_tab.values())} rows across {len(by_tab)} tabs")
 
     meta_ws, meta = load_meta(sheet)
     for tab_name, rows in by_tab.items():
@@ -701,6 +708,13 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
             seen_vehicles.add(vehicle)
             vehicle_order.append(vehicle)
 
+    # User-deletion detection — must be captured BEFORE Step 2 adds new keys to meta.
+    # Keys in meta for this tab that are no longer in the sheet were intentionally
+    # deleted by the user.  We never recreate them from Fleetx.
+    # To undo: delete the entry from the hidden _meta tab and rerun.
+    previously_written = {k for (t, k) in meta if t == tab_name}
+    user_deleted       = previously_written - set(existing_by_key.keys())
+
     # Step 2: build incoming rows from Fleetx data
     incoming:               dict[str, list] = {}
     incoming_vehicle_order: list[str]       = []
@@ -734,16 +748,12 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
             incoming_seen.add(vehicle)
             incoming_vehicle_order.append(vehicle)
 
-    # Step 3: merge keyed rows; orphan rows are untouched
-    #
-    # User-deletion detection: any key that was previously written to this tab
-    # (exists in meta for this tab) but is no longer in the sheet means the
-    # user intentionally deleted that row.  We respect the deletion and never
-    # recreate it from Fleetx.  To undo a deletion, remove the row from the
-    # hidden _meta tab and rerun.
-    previously_written = {k for (t, k) in meta if t == tab_name}
-    user_deleted       = previously_written - set(existing_by_key.keys())
+    print(f"[debug] {tab_name}: {len(new_rows)} new_rows, {len(incoming)} incoming, {len(existing_by_key)} existing")
+    if incoming:
+        sample_key = next(iter(incoming))
+        print(f"[debug] sample key={sample_key!r}, row[1]={incoming[sample_key][1]!r}")
 
+    # Step 3: merge keyed rows; orphan rows are untouched
     merged: dict[str, list] = {}
     for key, ex_row in existing_by_key.items():
         merged[key] = incoming.get(key, ex_row)
@@ -755,10 +765,13 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
         if v not in seen_vehicles:
             vehicle_order.append(v)
 
+    print(f"[debug] {tab_name}: merged={len(merged)}, vehicle_order={vehicle_order[:3]}")
+
     # Group by vehicle, sort by start_date, renumber S.NO
     by_vehicle: dict[str, list[list]] = {}
     for row in merged.values():
         by_vehicle.setdefault(row[1], []).append(row)
+    print(f"[debug] {tab_name}: by_vehicle keys={list(by_vehicle.keys())[:3]}")
     for vehicle in by_vehicle:
         by_vehicle[vehicle].sort(key=lambda r: r[7] or "")
         for i, row in enumerate(by_vehicle[vehicle], start=1):
