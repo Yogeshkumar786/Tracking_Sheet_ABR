@@ -55,22 +55,23 @@ TRACKING_TAB    = os.environ.get("TRACKING_TAB", "Live Tracking")
 SHEET_ID        = os.environ.get("MANIFEST_SHEET_ID")
 
 MANIFEST_HEADERS = [
-    "S.NO", "VEHICLE NO.", "VEHICLE TYPE", "MANIFEST NO",
+    "S.NO", "VEHICLE NO.", "VEHICLE TYPE", "MANIFEST DATE", "MANIFEST NO",
     "FROM", "TO", "START DATE", "END DATE",
     "DR. NAME", "DR. CODE", "Advance(In Cash)",
     "Round Trip(HSD)", "HSD Rate/Ltr", "Total Cost",
 ]
 # Manifest column indices that users fill in manually (never overwritten from Fleetx)
-_MANIFEST_MANUAL_COLS = {2, 3, 8, 9, 10, 11, 12, 13}
+_MANIFEST_MANUAL_COLS = {2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14}
 
 META_TAB = "_meta"
 META_HEADERS = [
     "tab", "key",
     "vehicle_type", "manifest_no", "dr_name", "dr_code",
     "advance", "round_trip_hsd", "hsd_rate", "total_cost",
+    "manifest_date", "start_date", "end_date",  # appended — does not shift existing meta cols
 ]
 # manifest col → meta col (meta cols 2+ hold the manual values)
-_MANIFEST_TO_META = {2: 2, 3: 3, 8: 4, 9: 5, 10: 6, 11: 7, 12: 8, 13: 9}
+_MANIFEST_TO_META = {2: 2, 4: 3, 9: 4, 10: 5, 11: 6, 12: 7, 13: 8, 14: 9, 3: 10, 7: 11, 8: 12}
 _META_TO_MANIFEST = {v: k for k, v in _MANIFEST_TO_META.items()}
 
 _FLEETX_HEADERS = {
@@ -330,8 +331,15 @@ def find_vehicle_journeys(trips: list, watched_pois: list) -> list:
             if not base:
                 prev_e_p, prev_e_date = e_p, t.get("eDate")
                 continue
-            src         = base
-            departed_at = current_since if current is not None else t["sDate"]
+            src = base
+            # Use the last confirmed timestamp at source POI (eDate of prev trip)
+            # rather than when the vehicle first arrived there.  This avoids
+            # recording a departure time from hours/days ago when GPS jitter kept
+            # re-entering the geofence.
+            if current is not None and prev_e_p is not None and prev_e_p["id"] == src["id"]:
+                departed_at = prev_e_date
+            else:
+                departed_at = t["sDate"]
             saved_since = current_since
             legs_buf    = [t]
             current     = None
@@ -378,12 +386,14 @@ def find_vehicle_journeys(trips: list, watched_pois: list) -> list:
 
 
 def journey_to_row(j: dict, vehicle_plate: str) -> dict:
+    start_date = j["departed_at"] or ""
     return {
-        "vehicle":    vehicle_plate,
-        "from":       j["src"]["name"] if j["src"] else "",
-        "to":         j["dst"]["name"] if j["dst"] else "",
-        "start_date": j["departed_at"] or "",
-        "end_date":   j["arrived_at"]  or "",
+        "vehicle":       vehicle_plate,
+        "manifest_date": str(start_date)[:10] if start_date else "",
+        "from":          j["src"]["name"] if j["src"] else "",
+        "to":            j["dst"]["name"] if j["dst"] else "",
+        "start_date":    start_date,
+        "end_date":      j["arrived_at"]  or "",
     }
 
 
@@ -651,6 +661,14 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
     if not existing_raw:
         existing_raw = [MANIFEST_HEADERS]
 
+    # Migrate old-schema rows (no MANIFEST DATE column) to new schema in-memory
+    if existing_raw:
+        h = existing_raw[0]
+        if len(h) < 4 or h[3] != "MANIFEST DATE":
+            existing_raw = [MANIFEST_HEADERS] + [
+                [*row[:3], "", *row[3:]] for row in existing_raw[1:]
+            ]
+
     # Step 1: scan existing rows — separate keyed rows (vehicle+start_date present)
     # from orphan rows (missing either field — user-added, script never touches them)
     orphan_rows:     list[list]       = []
@@ -662,16 +680,14 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
         if not any(raw):
             continue  # blank separator row — skip, do not trigger orphan mode
         vehicle    = raw[1] if len(raw) > 1 else ""
-        start_date = raw[6] if len(raw) > 6 else ""
+        start_date = raw[7] if len(raw) > 7 else ""
         has_key    = bool(vehicle and start_date)
 
         if not has_key:
             orphan_rows.append((list(raw) + [""] * len(MANIFEST_HEADERS))[:len(MANIFEST_HEADERS)])
             continue
 
-        # Old schema stored _key in col 14 — use it if present
-        key = (raw[14] if len(raw) > 14 and raw[14]
-               else _row_key(vehicle, start_date))
+        key = _row_key(vehicle, start_date)
 
         existing_by_key[key] = (list(raw) + [""] * len(MANIFEST_HEADERS))[:len(MANIFEST_HEADERS)]
 
@@ -695,20 +711,21 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
         key     = _row_key(vehicle, r.get("start_date", ""))
         manual  = meta.get((tab_name, key), {})
         row = [
-            "",                       # S.NO
-            vehicle,                  # VEHICLE NO.
-            manual.get(2,  ""),       # VEHICLE TYPE
-            manual.get(3,  ""),       # MANIFEST NO
-            r.get("from", ""),        # FROM
-            r.get("to",   ""),        # TO
-            r.get("start_date", ""),  # START DATE
-            r.get("end_date",   ""),  # END DATE
-            manual.get(8,  ""),       # DR. NAME
-            manual.get(9,  ""),       # DR. CODE
-            manual.get(10, ""),       # Advance(In Cash)
-            manual.get(11, ""),       # Round Trip(HSD)
-            manual.get(12, ""),       # HSD Rate/Ltr
-            manual.get(13, ""),       # Total Cost
+            "",                            # S.NO
+            vehicle,                       # VEHICLE NO.
+            manual.get(2,  ""),                                    # VEHICLE TYPE
+            manual.get(3, r.get("manifest_date", "")),         # MANIFEST DATE (manual; auto-default on first write)
+            manual.get(4,  ""),            # MANIFEST NO
+            r.get("from", ""),                                     # FROM
+            r.get("to",   ""),                                     # TO
+            manual.get(7, r.get("start_date", "")),               # START DATE (manual override)
+            manual.get(8, r.get("end_date",   "")),               # END DATE   (manual override)
+            manual.get(9,  ""),            # DR. NAME
+            manual.get(10, ""),            # DR. CODE
+            manual.get(11, ""),            # Advance(In Cash)
+            manual.get(12, ""),            # Round Trip(HSD)
+            manual.get(13, ""),            # HSD Rate/Ltr
+            manual.get(14, ""),            # Total Cost
         ]
         incoming[key] = row
         if (tab_name, key) not in meta:
@@ -718,11 +735,20 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
             incoming_vehicle_order.append(vehicle)
 
     # Step 3: merge keyed rows; orphan rows are untouched
+    #
+    # User-deletion detection: any key that was previously written to this tab
+    # (exists in meta for this tab) but is no longer in the sheet means the
+    # user intentionally deleted that row.  We respect the deletion and never
+    # recreate it from Fleetx.  To undo a deletion, remove the row from the
+    # hidden _meta tab and rerun.
+    previously_written = {k for (t, k) in meta if t == tab_name}
+    user_deleted       = previously_written - set(existing_by_key.keys())
+
     merged: dict[str, list] = {}
     for key, ex_row in existing_by_key.items():
         merged[key] = incoming.get(key, ex_row)
     for key, row in incoming.items():
-        if key not in merged:
+        if key not in merged and key not in user_deleted:
             merged[key] = row
 
     for v in incoming_vehicle_order:
@@ -734,7 +760,7 @@ def _upsert_one_manifest_tab(sheet, tab_name: str, new_rows: list[dict],
     for row in merged.values():
         by_vehicle.setdefault(row[1], []).append(row)
     for vehicle in by_vehicle:
-        by_vehicle[vehicle].sort(key=lambda r: r[6] or "")
+        by_vehicle[vehicle].sort(key=lambda r: r[7] or "")
         for i, row in enumerate(by_vehicle[vehicle], start=1):
             row[0] = i
 
