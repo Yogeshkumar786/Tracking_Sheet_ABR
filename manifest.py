@@ -8,7 +8,7 @@ Secrets required (GitHub repo Settings -> Secrets -> Actions):
     Manifest_SHEET_ID             Google Sheet ID (long string in the URL)
 
 Optional env vars:
-    FLEETX_LOOKBACK_DAYS   Days to look back (default 7)
+    FLEETX_LOOKBACK_DAYS   Days to look back (default 3)
     FLEETX_BACKFILL_FROM   YYYY-MM-DD — fetch from this date instead of rolling window
 
 Routes tab columns (either schema, rows can be mixed):
@@ -47,7 +47,7 @@ HERE = Path(__file__).parent
 FLEETX_API      = "https://api.fleetx.io"
 TOKEN_CACHE     = HERE / ".token_cache.json"
 
-LOOKBACK_DAYS   = int(os.environ.get("FLEETX_LOOKBACK_DAYS", "7"))
+LOOKBACK_DAYS   = int(os.environ.get("FLEETX_LOOKBACK_DAYS", "3"))
 BACKFILL_FROM   = os.environ.get("FLEETX_BACKFILL_FROM")
 ROUTES_TAB      = os.environ.get("ROUTES_TAB", "Routes")
 POIS_TAB        = os.environ.get("POIS_TAB", "POIs")
