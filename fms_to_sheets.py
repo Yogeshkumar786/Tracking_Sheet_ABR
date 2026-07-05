@@ -158,22 +158,26 @@ COLUMNS = [
     (4,  "Vehicle_Type",                      "auto"),
     (5,  "Route",                             "auto"),
     (6,  "Route_Code",                        "auto"),
-    (7,  "Route_Start_Date_Time",             "auto"),
-    (8,  "Status",                            "auto"),
-    (9,  "Current_Stage",                     "auto"),     # color-coded
-    (10, "Ontime_Delay",                      "auto"),
-    (11, "Current_Location",                  "auto"),
-    (12, "Delay_Hrs",                         "auto"),
-    (13, "Current_Stop_Since",                "auto"),
-    (14, "Current_Stop_Duration",             "auto"),
-    (15, "Last_GPS_Update",                   "auto"),
-    (16, "Last_Refreshed",                    "auto"),
+    (7,  "Route_TAT",                         "manual"),   # H — user-only
+    (8,  "Route_Start_Date_Time",             "auto"),     # I
+    (9,  "Route_Scheduled_Arrival",           "manual"),   # J — user-only / formula
+    (10, "Route_End_Date_Time",               "manual"),   # K — user-only
+    (11, "Status",                            "auto"),     # L
+    (12, "Current_Stage",                     "auto"),     # M — color-coded
+    (13, "Ontime_Delay",                      "auto"),     # N
+    (14, "Current_Location",                  "auto"),     # O
+    (15, "Reason",                            "manual"),   # P — user-only
+    (16, "Delay_Hrs",                         "auto"),     # Q
+    (17, "Current_Stop_Since",                "auto"),     # R
+    (18, "Current_Stop_Duration",             "auto"),     # S
+    (19, "Last_GPS_Update",                   "auto"),     # T
+    (20, "Last_Refreshed",                    "auto"),     # U
 ]
 
 KEY_COL    = 3    # Vehicle_No
-STATUS_COL = 8
-STAGE_COL  = 9    # Current_Stage (colored)
-ONTIME_COL = 10
+STATUS_COL = 11   # L
+STAGE_COL  = 12   # M  Current_Stage (colored)
+ONTIME_COL = 13   # N
 
 # Columns removed/renamed — auto-deleted from sheets on first run.
 _STALE_COLUMNS = [
@@ -187,7 +191,6 @@ _STALE_COLUMNS = [
     "Challan_MH_Border",
     "In_Route_Extra_DSL",
     "In_Route_Maintenance_Exp",
-    "Reason",
     "Driver_Name",
     "Driver_Code",
     "Given_Advance",
@@ -1168,8 +1171,17 @@ def append_lookup_rows(ws: gspread.Worksheet, new_entries: dict):
 
 
 def write_headers(ws: gspread.Worksheet, existing_header_row: list):
-    """Write header row only when it has actually changed (uses pre-loaded data)."""
-    # One-time migration: delete any stale columns no longer in the layout.
+    """
+    Write / correct header cells for script-managed ('auto') columns ONLY.
+
+    NEVER touches 'manual' columns (Route_TAT, Route_Scheduled_Arrival,
+    Route_End_Date_Time, Reason) — those are user-owned and may contain
+    custom headers or formulas.  Writing them cell-by-cell (not as a full
+    row overwrite) means user-inserted columns are safe no matter what.
+
+    Also deletes any stale columns that are no longer part of the layout.
+    """
+    # ── One-time migration: delete stale columns ──────────────────────────────
     for stale in _STALE_COLUMNS:
         if stale in existing_header_row:
             col_idx = existing_header_row.index(stale)
@@ -1181,21 +1193,52 @@ def write_headers(ws: gspread.Worksheet, existing_header_row: list):
             print(f"  [Migration] Deleted stale column '{stale}' from "
                   f"{ws.spreadsheet.title}/{ws.title}", flush=True)
 
-    headers = [c[1] for c in COLUMNS]
-    if existing_header_row[:len(headers)] == headers:
+    # ── Write only auto-column headers (cell by cell, never a full-row write) ─
+    cell_updates  = []
+    format_ranges = []
+    changed       = False
+
+    for col_idx, name, ctype in COLUMNS:
+        if ctype == "manual":
+            continue   # ← SKIP user-owned columns entirely
+        current = (existing_header_row[col_idx].strip()
+                   if col_idx < len(existing_header_row) else "")
+        if current == name:
+            continue   # already correct
+        changed = True
+        cell_updates.append({
+            "range":  f"{COL_LETTERS[col_idx]}{HEADER_ROW}",
+            "values": [[name]],
+        })
+        format_ranges.append({
+            "sheetId":          ws.id,
+            "startRowIndex":    0,
+            "endRowIndex":      1,
+            "startColumnIndex": col_idx,
+            "endColumnIndex":   col_idx + 1,
+        })
+
+    if not changed:
         return
-    print("  [Sheet] Writing headers…", flush=True)
-    ws.update(values=[headers], range_name=f"A{HEADER_ROW}", value_input_option="RAW")
-    ws.spreadsheet.batch_update({"requests": [{"repeatCell": {
-        "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
-                  "startColumnIndex": 0, "endColumnIndex": TOTAL_COLS},
-        "cell": {"userEnteredFormat": {
-            "backgroundColor": HEADER_COLOR,
-            "textFormat": {"foregroundColor": WHITE, "bold": True, "fontSize": 10},
-            "horizontalAlignment": "CENTER",
-        }},
-        "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
-    }}]})
+
+    print("  [Sheet] Correcting headers…", flush=True)
+    if cell_updates:
+        ws.batch_update(cell_updates, value_input_option="RAW")
+
+    # Apply standard header formatting to updated cells only
+    if format_ranges:
+        ws.spreadsheet.batch_update({"requests": [
+            {"repeatCell": {
+                "range": r,
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": HEADER_COLOR,
+                    "textFormat": {"foregroundColor": WHITE, "bold": True, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                }},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)",
+            }}
+            for r in format_ranges
+        ]})
 
 
 def _parse_sheet(all_rows: list[list]) -> tuple[dict, dict]:
@@ -1310,21 +1353,25 @@ def build_row(v: dict, sno: int,
             else:
                 row[idx] = NOT_ASSIGNED if not v.get("isOnTrip") else ""
         elif idx == 6:  row[idx] = route_code or (NOT_ASSIGNED if not v.get("isOnTrip") else "")
-        elif idx == 7:  row[idx] = fmt(v.get("dispatchDate"))   or (NOT_ASSIGNED if not v.get("isOnTrip") else "")
-        elif idx == 8:  row[idx] = status
-        elif idx == 9:  row[idx] = stage
-        elif idx == 10:
+        elif idx == 7:  row[idx] = None  # Route_TAT — user-only
+        elif idx == 8:  row[idx] = fmt(v.get("dispatchDate"))   or (NOT_ASSIGNED if not v.get("isOnTrip") else "")
+        elif idx == 9:  row[idx] = None  # Route_Scheduled_Arrival — user-only
+        elif idx == 10: row[idx] = None  # Route_End_Date_Time — user-only
+        elif idx == 11: row[idx] = status
+        elif idx == 12: row[idx] = stage
+        elif idx == 13:
             if sla_label is not None:                 # our SLA calc
                 row[idx] = sla_label
             else:                                     # FMS fallback (no SLA yet)
                 ontime = fmt(v.get("ontime"))
                 row[idx] = ontime if ontime else ("Not On Trip" if not v.get("isOnTrip") else "")
-        elif idx == 11:
+        elif idx == 14:
             loc = fmt(v.get("lastLocation"))
             # Normalise double prefix: "AT at safexpress …" → "AT safexpress …"
             loc = re.sub(r'^(at\s+){2,}', 'AT ', loc, flags=re.IGNORECASE)
             row[idx] = loc
-        elif idx == 12:
+        elif idx == 15: row[idx] = None  # Reason — user-only
+        elif idx == 16:
             if sla_delay is not None:                 # our SLA calc
                 row[idx] = sla_delay
             elif not v.get("isOnTrip"):               # FMS fallback
@@ -1332,9 +1379,9 @@ def build_row(v: dict, sno: int,
             else:
                 delay_hrs = parse_delay_hrs(v.get("delayTime") or "")
                 row[idx] = hrs_to_hms(delay_hrs) if delay_hrs > 0 else "00:00:00"
-        elif idx == 13:
+        elif idx == 17:
             row[idx] = via_since   # earliest start; GPS-glitch-resistant for via stops
-        elif idx == 14:
+        elif idx == 18:
             if stage in hub_stop_stages and via_since:
                 # Recalculate from preserved start → immune to GPS glitch resets
                 since_dt = _parse_since_dt(via_since)
@@ -1342,7 +1389,7 @@ def build_row(v: dict, sno: int,
                            else fmt(v.get("stoppageDuration"))
             else:
                 row[idx] = fmt(v.get("stoppageDuration"))
-        elif idx == 15:
+        elif idx == 19:
             raw = fmt(v.get("lastLocationDatetime"))
             if raw:
                 try:   # API returns "YYYY-MM-DD HH:MM:SS" — reformat to match other cols
@@ -1352,7 +1399,7 @@ def build_row(v: dict, sno: int,
                     row[idx] = raw   # unknown format — keep as-is
             else:
                 row[idx] = ""
-        elif idx == 16: row[idx] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        elif idx == 20: row[idx] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         else:           row[idx] = ""
     return row
 
@@ -1837,7 +1884,7 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
                                   if live_row and col_idx < len(live_row) else "")
                     shadow_val = (shadow_row[col_idx].strip()
                                   if shadow_row and col_idx < len(shadow_row) else "")
-                    if live_val != shadow_val:
+                    if live_val != shadow_val and live_val != "":
                         edits_kept += 1
                         continue   # user-edited → preserve until next trip
                 tracking_updates.append({
@@ -1851,7 +1898,7 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
 
             # Colors follow the value actually shown in each indicator column.
             status_color = STATUS_COLORS.get(status, WHITE)
-            ontime_color = ONTIME_COLORS.get(row_data[10], WHITE)
+            ontime_color = ONTIME_COLORS.get(row_data[13], WHITE)
 
             color_requests.extend([
                 _cell_color(ws.id, trk_row, STATUS_COL,  status_color),   # Status
@@ -1870,12 +1917,24 @@ def write_tracking(ss, ws: gspread.Worksheet, vehicles: list[dict], shared: dict
     # Blank rows for vehicles that no longer belong in this (hub) sheet.
     # Blank BOTH Tracking and shadow rows so the freeze resets if the vehicle
     # returns to this hub later.
+    # NOTE: vehicles managed by ctyf_to_sheets.py are exempt — they are not
+    #       in the FMS API response so must never be treated as "strangers".
+    _ctyf_file = Path(__file__).parent / "ctyf_vehicles.json"
+    try:
+        import json as _json
+        _ctyf_vnos: set = set(_json.loads(_ctyf_file.read_text())) \
+                          if _ctyf_file.exists() else set()
+    except Exception:
+        _ctyf_vnos = set()
+
     removed = 0
     if remove_strangers:
         blank_row = [""] * TOTAL_COLS
         last_col  = COL_LETTERS[-1]
         for vno, rnum in row_map.items():
             if vno not in valid_vnos:
+                if vno in _ctyf_vnos:
+                    continue   # CTYF-managed — never blank
                 # Now blank the row
                 tracking_updates.append({"range":  f"A{rnum}:{last_col}{rnum}",
                                          "values": [blank_row]})
