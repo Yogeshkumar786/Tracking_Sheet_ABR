@@ -648,10 +648,14 @@ def main():
         print(f"  ERROR: {exc}")
 
     print("\n[4] Hub sheets...")
+    def _norm(s: str) -> str:
+        return s.replace(" ", "").lower()
+
     for hub_name, hub_sheet_id in HUB_TRACKING_SHEETS.items():
+        hub_norm = _norm(hub_name)
         hub_vehicles = {
             vno: vdata for vno, vdata in ctyf_data.items()
-            if hub_map.get(vno, "").strip().lower() == hub_name.lower()
+            if _norm(hub_map.get(vno, "")) == hub_norm
         }
         if not hub_vehicles:
             print(f"  [Skip] {hub_name}: no CTYF vehicles assigned here")
