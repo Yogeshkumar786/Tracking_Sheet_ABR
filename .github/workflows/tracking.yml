@@ -30,7 +30,7 @@ jobs:
       - name: Write Google credentials
         run: printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
 
       - name: Write CTYF config
         run: printf '%s' "$CTYF_CONFIG" > ctyf_config.json
