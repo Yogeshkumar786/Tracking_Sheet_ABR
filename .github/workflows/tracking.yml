@@ -1,27 +1,41 @@
-name: FMS Tracking
+name: ABR Tracking Automation
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/20 * * * *'
   workflow_dispatch:
 
 jobs:
-  track:
+  run-trackers:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
+    concurrency:
+      group: abr-tracking
+      cancel-in-progress: false
     env:
       TZ: Asia/Kolkata
-    concurrency:
-      group: fms-tracking
-      cancel-in-progress: false
+      PYTHONIOENCODING: utf-8
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      - run: pip install -r requirements.txt
-      - run: printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google credentials
+        run: printf '%s' "$GOOGLE_CREDENTIALS" > credentials.json
         env:
-          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-      - run: python fms_to_sheets.py
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+      - name: Write CTYF config
+        run: printf '%s' "$CTYF_CONFIG" > ctyf_config.json
+        env:
+          CTYF_CONFIG: ${{ secrets.CTYF_CONFIG_JSON }}
+
+      - name: Run trackers
+        run: python run_all.py
