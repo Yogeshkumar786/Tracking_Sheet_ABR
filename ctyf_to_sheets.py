@@ -60,6 +60,9 @@ CREDS_FILE      = Path(__file__).parent / "credentials.json"
 HUB_TRACKING_SHEETS = {
     "Ambala":       "1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE",
     "Ambala Local": "1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ",
+    "Binola": "1dagH3DjC4dXMQwVHVoE9mMJUQRPYEH6KDPc6OolLm5A",
+    "Binola Local": "15xvjwps6zuOP3ZKCPzsGRHUQuh24-4wh8Mm9tT8O-i8",
+    "G.Noida": "16DgFINLCJ3-AUirn1MRSZS2LrrgO4LoudyzoMzaMk-U",
 }
 
 DATA_START  = 2
