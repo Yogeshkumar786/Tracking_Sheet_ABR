@@ -39,11 +39,11 @@ SHADOW_TAB            = "_shadow"          # hidden mirror of last script-writte
 # vehicles whose "Vehicle Hub" (in the master Vehicles tab) matches the key.
 # The master file above keeps everything (all vehicles + side tabs + stoppage).
 HUB_TRACKING_SHEETS = {
-    "Ambala":       "1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE",
-    "Ambala Local": "1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ",
-    "Binola": "1dagH3DjC4dXMQwVHVoE9mMJUQRPYEH6KDPc6OolLm5A",
-    "Binola Local": "15xvjwps6zuOP3ZKCPzsGRHUQuh24-4wh8Mm9tT8O-i8",
-    "G.Noida": "16DgFINLCJ3-AUirn1MRSZS2LrrgO4LoudyzoMzaMk-U",
+    "Ambala":       ("1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE", "Tracking"),
+    "Ambala Local": ("1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ",  "Tracking"),
+    "Binola":       ("1dagH3DjC4dXMQwVHVoE9mMJUQRPYEH6KDPc6OolLm5A",  "Tracking"),
+    "Binola Local": ("15xvjwps6zuOP3ZKCPzsGRHUQuh24-4wh8Mm9tT8O-i8",  "Tracking"),
+    "G.Noida":      ("16DgFINLCJ3-AUirn1MRSZS2LrrgO4LoudyzoMzaMk-U",  "Tracking"),
 }
 
 # Per-hub trip (MIS) sheets are intentionally disabled in this version.
@@ -2031,12 +2031,18 @@ def run_once(dry_run: bool = False):
         print("\n  [REACHED] No vehicles at final destination this cycle.", flush=True)
 
     # ── Hub mirrors: each gets ONLY its hub's vehicles (Tracking tab) ────────
+    # Normalise hub names: strip spaces + lowercase so "BinolaLocal" and
+    # "Binola Local" both match the "Binola Local" key in HUB_TRACKING_SHEETS.
+    def _norm(s: str) -> str:
+        return s.replace(" ", "").lower()
+
     vehicle_hub = shared["vehicle_hub"]
     for hub_name, (sheet_id, tab) in HUB_TRACKING_SHEETS.items():
+        hub_norm = _norm(hub_name)
         subset = [v for v in vehicles
-                  if vehicle_hub.get((v.get("vehicleNumber") or "").strip(), "")
-                  == hub_name]
-        print(f"\n  → Hub '{hub_name}': {len(subset)} vehicle(s)", flush=True)
+                  if _norm(vehicle_hub.get(
+                      (v.get("vehicleNumber") or "").strip(), "")) == hub_norm]
+        print(f"\n  -> Hub '{hub_name}': {len(subset)} vehicle(s)", flush=True)
         try:
             hub_ss, hub_ws = connect(sheet_id, tab)
             write_tracking(hub_ss, hub_ws, subset, shared, dry_run=dry_run,
