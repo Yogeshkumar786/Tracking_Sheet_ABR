@@ -39,8 +39,11 @@ SHADOW_TAB            = "_shadow"          # hidden mirror of last script-writte
 # vehicles whose "Vehicle Hub" (in the master Vehicles tab) matches the key.
 # The master file above keeps everything (all vehicles + side tabs + stoppage).
 HUB_TRACKING_SHEETS = {
-    "Ambala":       ("1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE", "Tracking"),
-    "Ambala Local": ("1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ", "Tracking"),
+    "Ambala":       "1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE",
+    "Ambala Local": "1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ",
+    "Binola": "1dagH3DjC4dXMQwVHVoE9mMJUQRPYEH6KDPc6OolLm5A",
+    "Binola Local": "15xvjwps6zuOP3ZKCPzsGRHUQuh24-4wh8Mm9tT8O-i8",
+    "G.Noida": "16DgFINLCJ3-AUirn1MRSZS2LrrgO4LoudyzoMzaMk-U",
 }
 
 # Per-hub trip (MIS) sheets are intentionally disabled in this version.
