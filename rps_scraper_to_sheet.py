@@ -60,11 +60,11 @@ ROUTE_CODES_TAB = "Route Codes"
 ROUTE_SLA_TAB   = "Route SLA"
 
 HUB_TRIP_SHEETS: dict[str, str] = {
-    "Ambala":       "1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE",
-    "Ambala Local": "1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ",
-    "Binola":       "1dagH3DjC4dXMQwVHVoE9mMJUQRPYEH6KDPc6OolLm5A",
-    "Binola Local": "15xvjwps6zuOP3ZKCPzsGRHUQuh24-4wh8Mm9tT8O-i8",
-    "G.Noida":      "16DgFINLCJ3-AUirn1MRSZS2LrrgO4LoudyzoMzaMk-U",
+    "Ambala":       "1_unl3WrQZngLUdS1-jA95UZpkjoa1ZqZIIiu3G11DBo",
+    "Ambala Local": "1SeJ06RjF2ONqCsP53_NO0FEjKhY3EV5UrNtLMmsA2N4",
+    "Binola":       "1Jz5N01qzwJRStr5Vb9oIU_DeGshiEeL4kLkMiomIeA8",
+    "Binola Local": "1f6IDh2ALPdH51XezH30flX2rZN5zFoVnf-TGsa1Eeuw",
+    "G.Noida":      "1egmOZultBulPIzwzYbjgxYkfkoC22LmzepMlih8-arE",
 }
 
 _HUB_TRIP_SHEETS_NORM: dict[str, tuple[str, str]] = {
