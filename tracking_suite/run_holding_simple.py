@@ -125,6 +125,65 @@ def _hhmm(minutes: float) -> str:
 # hub, or within this many km of it, and has stopped.
 REACHED_KM = 5.0
 
+# Unloading takes at most this long after reaching the hub. Past it, the truck
+# is detained at the destination, not unloading.
+UNLOAD_MAX_HRS = 2.0
+# Radius (m) within which a GPS ping counts as "still at the hub".
+AT_HUB_M = 1500.0
+
+
+def _ping_dt(p):
+    for f in ("datetimestamp", "datetime", "gpsdatetime", "deviceDatetime",
+              "dateTime", "date_time", "gpsDatetime"):
+        raw = p.get(f)
+        if raw:
+            for fmt in fms._DT_FORMATS:
+                try:
+                    return datetime.strptime(str(raw).strip(), fmt)
+                except ValueError:
+                    continue
+    return None
+
+
+def arrived_at_current(live, now, days: int = 8):
+    """When did the vehicle arrive at where it is standing now — from its GPS
+    trail, by coordinates only. Walk the tracking report back from now and find
+    the start of the continuous run of pings within AT_HUB_M of the current
+    position (a couple of stray out-of-radius pings are absorbed as GPS drift).
+    Returns the arrival datetime, or None if the trail can't be read."""
+    from tracking_suite.presence import haversine_m
+    vid = live.get("vehicleId")
+    lat, lon = fms.position(live)
+    if not (vid and lat and lon):
+        return None
+    try:
+        vid = int(vid)
+    except (TypeError, ValueError):
+        return None
+    pings = fms.tracking_report(vid, now - timedelta(days=days), now)
+    pts = []
+    for p in pings:
+        try:
+            la = float(p.get("latitude") or 0)
+            lo = float(p.get("longitude") or 0)
+        except (TypeError, ValueError):
+            continue
+        dt = _ping_dt(p)
+        if la and lo and dt:
+            pts.append((dt, la, lo))
+    if not pts:
+        return None
+    pts.sort(key=lambda x: x[0])
+    arrival, out = pts[-1][0], 0
+    for dt, la, lo in reversed(pts):
+        if haversine_m(lat, lon, la, lo) <= AT_HUB_M:
+            arrival, out = dt, 0
+        else:
+            out += 1
+            if out > 2:            # left the hub for good going backwards
+                break
+    return arrival
+
 
 def build_rows(universe: list, branch_of: dict, lanes: dict, presence_by: dict,
                live_by: dict, names: dict, cluster: dict, now: datetime):
@@ -181,10 +240,16 @@ def build_rows(universe: list, branch_of: dict, lanes: dict, presence_by: dict,
                                  or lane.get("base", ""), names, index))
             to_disp = clean_name(fms.consignee_name(live)) or disp(dest, names, index)
             safe_disp = disp(at, names, index) or clean_name(fms.consignee_name(live))
-            since = fms.stopped_since(live) or fms.last_gps_dt(live) or now
+            # How long has it actually been AT the hub? Earliest of the GPS-trail
+            # arrival, the stop-start time, and the last fix — the longest, most
+            # complete answer. Then the 2-hour rule: unloading vs detained.
+            cands = [x for x in (arrived_at_current(live, now),
+                                 fms.stopped_since(live), fms.last_gps_dt(live)) if x]
+            since = min(cands) if cands else now
             stand_min = max(0.0, (now - since).total_seconds() / 60)
+            remark = "Unloading" if stand_min <= UNLOAD_MAX_HRS * 60 else "Detained"
             rows.append(_row(branch_of, vno, from_disp, to_disp, since,
-                             safe_disp, "Unloading", stand_min, now))
+                             safe_disp, remark, stand_min, now))
             continue
 
         # -- Not on a trip: idle between trips ------------------------------
