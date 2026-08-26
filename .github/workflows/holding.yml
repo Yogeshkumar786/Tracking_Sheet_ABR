@@ -1,0 +1,23 @@
+name: Holding Report (hourly)
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch: {}
+concurrency:
+  group: holding
+  cancel-in-progress: false
+jobs:
+  holding:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run holding report
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python -m tracking_suite.run_holding_simple
