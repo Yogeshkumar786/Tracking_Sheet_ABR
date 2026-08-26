@@ -146,8 +146,27 @@ def build_rows(universe: list, branch_of: dict, lanes: dict, presence_by: dict,
         # -- Active RPS (on trip) -------------------------------------------
         if fms.on_trip(live):
             dest = fms.current_dest_code(live)
+            # "Reached" the destination if: presence matched it, it is within a
+            # few km, OR the live location text is AT/Near a hub whose code is the
+            # destination (or its region). The last case catches destinations that
+            # are not in the verified Hub List (e.g. Baghpat) and code variants in
+            # the same city (MOH11 vs MOH400) — where the region check alone fails.
+            loc = (fms.last_location(live) or "")
+            m = re.search(r'\(([A-Za-z0-9]{2,8})\)', loc)
+            loccode = m.group(1).upper() if m else ""
+            near_hub = loc.strip().upper().startswith(("AT ", "NEAR"))
+            # city-name match: destination and location share a real place word
+            # (>=4 letters, not 'Safexpress'/'Hub' which _norm already drops).
+            # Catches code variants in one city (MOH11 vs MOH400 = Mohali).
+            dest_words = {w for w in _norm(fms.consignee_name(live)).split()
+                          if len(w) >= 4 and not w.isdigit()}
+            loc_words = {w for w in _norm(loc).split()
+                         if len(w) >= 4 and not w.isdigit()}
             reached = (dest and _region(at) == _region(dest)) \
-                or (0 < fms.remaining_km(live) <= REACHED_KM)
+                or (0 < fms.remaining_km(live) <= REACHED_KM) \
+                or (near_hub and dest and loccode
+                    and (loccode == dest or _region(loccode) == _region(dest))) \
+                or (near_hub and bool(dest_words & loc_words))
             stopped = not fms.running(live)
             if not (reached and stopped):
                 skipped["on_trip"] += 1     # still running its trip -> not held
