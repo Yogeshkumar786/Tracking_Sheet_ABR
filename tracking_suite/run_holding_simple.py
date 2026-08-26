@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -178,7 +178,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--days", type=int, default=30)
     args = ap.parse_args()
-    now = datetime.now()
+    # FMS trip times are IST; GitHub runners are UTC. Use IST wall-clock
+    # so the timestamps AND the standing-hours maths are correct in the cloud.
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30))).replace(tzinfo=None)
 
     print(f"\n{'=' * 74}\n  Holding Report (simple)  |  {now:%Y-%m-%d %H:%M:%S}\n"
           f"{'=' * 74}", flush=True)
