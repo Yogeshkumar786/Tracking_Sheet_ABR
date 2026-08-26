@@ -62,13 +62,14 @@ def clean_name(text: str) -> str:
     return " ".join(t.split())
 
 
-def disp(code: str, names: dict) -> str:
-    """Hub code -> plain hub name (no 'Safexpress'), from the Hub List name.
-    Falls back to the code when there is no name."""
-    if not code:
+def disp(ident: str, names: dict) -> str:
+    """A hub identifier -> plain display name. `ident` may be a code (looked up
+    in the names map) or already a name (from a route segment with no code) —
+    both are cleaned the same way."""
+    if not ident:
         return ""
-    nm = names.get(code, "")
-    return clean_name(nm) or code if nm else code
+    nm = names.get(ident)
+    return clean_name(nm) if nm else clean_name(ident)
 
 
 _NAME_CODE = re.compile(r'([A-Za-z][A-Za-z0-9 .&/\-]*?)\s*\(([A-Za-z0-9]{2,8})\)')

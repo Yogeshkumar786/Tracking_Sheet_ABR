@@ -64,11 +64,32 @@ def _parse_dt(s: str) -> datetime | None:
     return None
 
 
+def _seg_id(segment: str) -> str:
+    """A route segment -> a hub identifier. The bracket code if present
+    ('...(HRS11)' -> HRS11), otherwise the cleaned segment name
+    ('BENGALURU-11' -> BENGALURU). Many routes carry a code on only some
+    segments, so we must not require one."""
+    m = _CODE.search(segment or "")
+    if m:
+        return m.group(1).upper()
+    t = re.sub(r'\([^)]*\)', '', segment or '')
+    t = re.sub(r'\bSAFEXPRESS\b|\bHUB\b|\bOUTBOUND\b|-?\d+', '', t.upper())
+    return " ".join(t.split())
+
+
 def _endpoints(route: str) -> tuple[str, str]:
-    codes = [c.upper() for c in _CODE.findall(route or "")]
-    if len(codes) < 2:
+    """First and last hub of a route. Split on the segment separators the FMS
+    route strings use ('/', ';', ':', ','), take the ends. Returns codes where
+    the segment has one, else cleaned names — never empty when the route names
+    at least two places."""
+    segs = [s.strip() for s in re.split(r'\s*[/;:]\s*|\s*,\s*', route or "")
+            if s.strip()]
+    if not segs:
         return ("", "")
-    return codes[0], codes[-1]
+    if len(segs) == 1:
+        e = _seg_id(segs[0])
+        return (e, e)
+    return _seg_id(segs[0]), _seg_id(segs[-1])
 
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
