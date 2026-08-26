@@ -62,14 +62,40 @@ def clean_name(text: str) -> str:
     return " ".join(t.split())
 
 
-def disp(ident: str, names: dict) -> str:
-    """A hub identifier -> plain display name. `ident` may be a code (looked up
-    in the names map) or already a name (from a route segment with no code) —
-    both are cleaned the same way."""
+def _norm(s: str) -> str:
+    """Normalise for matching: drop '(code)', 'Safexpress', 'Hub', punctuation;
+    keep the distinguishing words (SDS/OUTBOUND/CITY) and the -11 number.
+    'SAFEXPRESS BENGALURU-11' -> 'BENGALURU 11'."""
+    s = re.sub(r'\([^)]*\)', '', s or '')
+    s = s.upper().replace("SAFEXPRESS", "").replace(" HUB", "")
+    s = re.sub(r'[^A-Z0-9]+', ' ', s)
+    return " ".join(s.split())
+
+
+def build_index(names: dict) -> list:
+    """[(normalised_hub_name, code), ...] longest first. The route text can be
+    anything, but the Hub List names are clean — so to identify a messy segment
+    we search each CLEAN hub name INTO the segment and take the longest that
+    fits ('BENGALURU SDS 11' beats 'BENGALURU 11' beats 'BENGALURU')."""
+    idx = [(_norm(nm), code) for code, nm in names.items() if _norm(nm)]
+    idx.sort(key=lambda t: -len(t[0]))
+    return idx
+
+
+def disp(ident: str, names: dict, index: list | None = None) -> str:
+    """A hub identifier -> clean display name. A code is looked up directly; a
+    messy route-segment name is identified by searching the clean hub-list names
+    into it (longest match wins), so From/To read as consistent hub names."""
     if not ident:
         return ""
-    nm = names.get(ident)
-    return clean_name(nm) if nm else clean_name(ident)
+    if ident in names:                       # already a code
+        return clean_name(names[ident])
+    if index:
+        nseg = _norm(ident)
+        for nkey, code in index:             # longest clean hub name that fits
+            if nkey and nkey in nseg:
+                return clean_name(names[code])
+    return clean_name(ident)                 # nothing matched -> cleaned text
 
 
 _NAME_CODE = re.compile(r'([A-Za-z][A-Za-z0-9 .&/\-]*?)\s*\(([A-Za-z0-9]{2,8})\)')
@@ -103,6 +129,7 @@ REACHED_KM = 5.0
 def build_rows(universe: list, branch_of: dict, lanes: dict, presence_by: dict,
                live_by: dict, names: dict, cluster: dict, now: datetime):
     rows = []
+    index = build_index(names)
     skipped = {"on_trip": 0, "moving": 0, "no_trip": 0, "not_tracked": 0}
 
     def _region(code):
@@ -132,9 +159,9 @@ def build_rows(universe: list, branch_of: dict, lanes: dict, presence_by: dict,
             last = lane.get("last") or {}
             from_disp = (clean_name(fms.consigner_name(live))
                          or disp(fms.origin_code(live) or last.get("origin")
-                                 or lane.get("base", ""), names))
-            to_disp = clean_name(fms.consignee_name(live)) or disp(dest, names)
-            safe_disp = disp(at, names) or clean_name(fms.consignee_name(live))
+                                 or lane.get("base", ""), names, index))
+            to_disp = clean_name(fms.consignee_name(live)) or disp(dest, names, index)
+            safe_disp = disp(at, names, index) or clean_name(fms.consignee_name(live))
             since = fms.stopped_since(live) or fms.last_gps_dt(live) or now
             stand_min = max(0.0, (now - since).total_seconds() / 60)
             rows.append(_row(branch_of, vno, from_disp, to_disp, since,
@@ -152,9 +179,9 @@ def build_rows(universe: list, branch_of: dict, lanes: dict, presence_by: dict,
             skipped["no_trip"] += 1
             continue
         stand_min = max(0.0, (now - idle_since).total_seconds() / 60)
-        rows.append(_row(branch_of, vno, disp(last["origin"], names),
-                         disp(last["dest"], names), idle_since,
-                         disp(at or last["dest"], names), "Empty", stand_min, now))
+        rows.append(_row(branch_of, vno, disp(last["origin"], names, index),
+                         disp(last["dest"], names, index), idle_since,
+                         disp(at or last["dest"], names, index), "Empty", stand_min, now))
 
     rows.sort(key=lambda r: -r["_min"])
     return rows, skipped
