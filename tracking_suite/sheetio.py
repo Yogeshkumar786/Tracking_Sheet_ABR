@@ -1,5 +1,14 @@
 """
-Sheets layer — credentials from env, locked to the master workbook.
+Shared Google Sheets layer — and the place the lock is enforced.
+===============================================================
+Every spreadsheet open in this package goes through `open_sheet()`, and
+`open_sheet()` calls `config.assert_locked()` first. There is no other route to
+a `gspread.Spreadsheet` here, so no runner can reach a second workbook even by
+mistake.
+
+Writing style follows what already works elsewhere in this folder: one
+`get_all_values()` per read, one `update()` per write, and colour only on the
+cells that carry a decision — never whole rows.
 """
 from __future__ import annotations
 
@@ -11,10 +20,22 @@ from google.oauth2.service_account import Credentials
 
 from tracking_suite import config
 
+CREDS_FILE = "credentials.json"
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+COLORS = {
+    "red":    {"red": 0.96, "green": 0.80, "blue": 0.80},
+    "orange": {"red": 1.00, "green": 0.88, "blue": 0.70},
+    "yellow": {"red": 1.00, "green": 0.95, "blue": 0.70},
+    "green":  {"red": 0.85, "green": 0.93, "blue": 0.83},
+    "blue":   {"red": 0.80, "green": 0.89, "blue": 0.97},
+    "grey":   {"red": 0.90, "green": 0.90, "blue": 0.90},
+    "white":  {"red": 1.00, "green": 1.00, "blue": 1.00},
+}
 
 HEADER_BG = {"red": 0.180, "green": 0.286, "blue": 0.490}
 HEADER_FG = {"red": 1.0, "green": 1.0, "blue": 1.0}
@@ -22,13 +43,22 @@ HEADER_FG = {"red": 1.0, "green": 1.0, "blue": 1.0}
 _client_cache = None
 
 
+def service_account_email() -> str:
+    try:
+        with open(CREDS_FILE, encoding="utf-8") as fh:
+            return json.load(fh).get("client_email", "(unknown)")
+    except Exception:
+        return "(could not read credentials.json)"
+
+
 def _creds() -> Credentials:
-    """Prefer the GOOGLE_CREDENTIALS_JSON secret; fall back to a local file."""
+    """Prefer the GOOGLE_CREDENTIALS_JSON secret (cloud); fall back to the
+    local credentials file."""
     raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
     if raw:
-        return Credentials.from_service_account_info(json.loads(raw), scopes=SCOPES)
-    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
-    return Credentials.from_service_account_file(path, scopes=SCOPES)
+        return Credentials.from_service_account_info(json.loads(raw),
+                                                     scopes=SCOPES)
+    return Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
 
 
 def client() -> gspread.Client:
@@ -38,24 +68,68 @@ def client() -> gspread.Client:
     return _client_cache
 
 
+def _with_quota_retry(fn, what: str):
+    """Central transient-failure handling. Two expected, retryable failures:
+    429s (the service account is shared with the hourly cloud job, so
+    per-minute read-quota collisions are normal) and dropped connections
+    (Google closing an idle socket mid-run). One place retries; nothing
+    else sleeps."""
+    import time
+    import requests
+    for attempt in range(3):
+        try:
+            return fn()
+        except gspread.exceptions.APIError as exc:
+            if "429" in str(exc) and attempt < 2:
+                wait = 65 * (attempt + 1)
+                print(f"  [Quota] 429 on {what} — waiting {wait}s "
+                      f"(shared service account)", flush=True)
+                time.sleep(wait)
+                continue
+            raise
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as exc:
+            if attempt < 2:
+                wait = 10 * (attempt + 1)
+                print(f"  [Net] connection dropped on {what} — retrying "
+                      f"in {wait}s", flush=True)
+                time.sleep(wait)
+                continue
+            raise
+
+
 def open_sheet(sheet_id: str | None = None):
+    """Open THE spreadsheet. Any other id raises before a request is made."""
     sid = config.assert_locked(sheet_id or config.sheet_id())
     try:
-        return client().open_by_key(sid)
-    except Exception as exc:
+        return _with_quota_retry(lambda: client().open_by_key(sid), "open")
+    except gspread.SpreadsheetNotFound as exc:
         raise RuntimeError(
-            f"Cannot open spreadsheet {sid}: {exc}\n"
-            f"  Share it as Editor with the service account, and check the "
-            f"GOOGLE_CREDENTIALS_JSON secret is set.") from exc
+            f"Spreadsheet {sid} not found, or the service account cannot see it.\n"
+            f"  Share it as Editor with:  {service_account_email()}"
+        ) from exc
+    except gspread.exceptions.APIError as exc:
+        raise RuntimeError(
+            f"Google refused access to spreadsheet {sid}: {exc}\n"
+            f"  Share it as Editor with:  {service_account_email()}"
+        ) from exc
 
 
 def find_tab(ss, name: str):
+    """Find a tab by name, tolerating stray case and surrounding whitespace.
+
+    The live Vehicles tab is titled 'Vehicles ' with a trailing space. Matching
+    exactly would fail on it, and renaming someone's tab to suit our code is the
+    wrong fix — so match loosely and use whatever is actually there.
+    """
     want = (name or "").strip().casefold()
-    for ws in ss.worksheets():
+    for ws in _with_quota_retry(ss.worksheets, "list tabs"):
         if ws.title.strip().casefold() == want:
             return ws
-    raise RuntimeError(f"Tab {name!r} not found. Present: "
-                       f"{[w.title for w in ss.worksheets()]}")
+    raise RuntimeError(
+        f"Tab {name!r} not found in {ss.title!r}. "
+        f"Tabs present: {[w.title for w in ss.worksheets()]}"
+    )
 
 
 def get_or_create(ss, title: str, ncols: int, nrows: int = 100):
@@ -75,11 +149,15 @@ def col_a1(idx0: int) -> str:
     return s
 
 
-def read_rows(ss, tab: str):
-    return find_tab(ss, tab).get_all_values()
+def read_rows(ss, tab: str) -> list[list]:
+    """One read. Returns raw rows including the header."""
+    return _with_quota_retry(lambda: find_tab(ss, tab).get_all_values(),
+                             f"read '{tab}'")
 
 
-def read_records(ss, tab: str):
+def read_records(ss, tab: str) -> list[dict]:
+    """Rows as dicts keyed by header name, so a column inserted by hand in the
+    UI does not shift anything. Headers are stripped of stray whitespace."""
     rows = read_rows(ss, tab)
     if not rows:
         return []
@@ -88,6 +166,62 @@ def read_records(ss, tab: str):
     for r in rows[1:]:
         if not any((c or "").strip() for c in r):
             continue
-        out.append({h: (r[i].strip() if i < len(r) and r[i] is not None else "")
-                    for i, h in enumerate(headers) if h})
+        rec = {}
+        for i, h in enumerate(headers):
+            if h:
+                rec[h] = (r[i].strip() if i < len(r) and r[i] is not None else "")
+        out.append(rec)
     return out
+
+
+def rebuild_tab(ss, title: str, headers: list, rows: list, *, quiet: bool = False):
+    """Clear the tab and write headers + rows in one update."""
+    ws = get_or_create(ss, title, len(headers), len(rows) + 10)
+    ws.clear()
+    matrix = [headers] + [["" if r.get(h) is None else r.get(h, "") for h in headers]
+                          for r in rows]
+    ws.update(values=matrix, range_name="A1", value_input_option="USER_ENTERED")
+    if not quiet:
+        print(f"  [Sheet] '{title}': wrote {len(rows)} row(s)", flush=True)
+    return ws
+
+
+def format_header(ws, ncols: int):
+    ws.format(f"A1:{col_a1(ncols - 1)}1", {
+        "backgroundColor": HEADER_BG,
+        "textFormat": {"bold": True, "foregroundColor": HEADER_FG},
+        "horizontalAlignment": "CENTER",
+    })
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
+
+
+def paint_cells(ws, headers: list, rows: list, *, quiet: bool = False):
+    """Reset the data block to white, then colour only the flagged cells.
+    Each row may carry '_colors': {header_name: colour_key}."""
+    if not rows:
+        return
+    col_of = {h: i for i, h in enumerate(headers)}
+    ws.format(f"A2:{col_a1(len(headers) - 1)}{len(rows) + 1}",
+              {"backgroundColor": COLORS["white"]})
+    specs = []
+    for i, r in enumerate(rows):
+        for hdr, colour in (r.get("_colors") or {}).items():
+            if hdr in col_of and colour in COLORS:
+                specs.append({
+                    "range": f"{col_a1(col_of[hdr])}{i + 2}",
+                    "format": {"backgroundColor": COLORS[colour]},
+                })
+    for k in range(0, len(specs), 200):
+        ws.batch_format(specs[k:k + 200])
+    if not quiet:
+        print(f"  [Sheet] coloured {len(specs)} cell(s)", flush=True)
+
+
+def write_report(ss, title: str, headers: list, rows: list, *, quiet: bool = False):
+    ws = rebuild_tab(ss, title, headers, rows, quiet=quiet)
+    format_header(ws, len(headers))
+    paint_cells(ws, headers, rows, quiet=quiet)
+    return ws

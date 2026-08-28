@@ -33,9 +33,9 @@ from datetime import datetime, timedelta
 import requests
 
 from tracking_suite.rps import (RPS_REPORT_URL, RPS_REPORT_HEADERS,
-                                RPS_REQUEST_TIMEOUT, RPS_BATCH_SIZE,
-                                _parse_rps_response,
-                                F_RPS, F_VEH, F_ROUTE, F_START, F_END)
+                                  RPS_REQUEST_TIMEOUT, RPS_BATCH_SIZE,
+                                  _parse_rps_response,
+                                  F_RPS, F_VEH, F_ROUTE, F_START, F_END)
 
 requests.packages.urllib3.disable_warnings()
 
@@ -65,31 +65,29 @@ def _parse_dt(s: str) -> datetime | None:
 
 
 def _seg_id(segment: str) -> str:
-    """A route segment -> a hub identifier. The bracket code if present
-    ('...(HRS11)' -> HRS11), otherwise the cleaned segment name
-    ('BENGALURU-11' -> BENGALURU). Many routes carry a code on only some
-    segments, so we must not require one."""
+    """A route segment -> a hub identifier: the bracket code if present, else the
+    cleaned segment name (many routes carry a code on only some segments)."""
     m = _CODE.search(segment or "")
     if m:
         return m.group(1).upper()
     t = re.sub(r'\([^)]*\)', '', segment or '')
-    t = re.sub(r'\bSAFEXPRESS\b|\bHUB\b|\bOUTBOUND\b|-?\d+', '', t.upper())
+    t = re.sub(r'\bSAFEXPRESS\b|\bHUB\b|-?\d+', '', t.upper())
     return " ".join(t.split())
 
 
+def route_segs(route: str) -> list:
+    """Ordered hub identifiers for a route string: [origin, via..., dest]."""
+    parts = [p.strip() for p in re.split(r'\s*[/;:]\s*|\s*,\s*', route or "") if p.strip()]
+    return [x for x in (_seg_id(p) for p in parts) if x]
+
+
 def _endpoints(route: str) -> tuple[str, str]:
-    """First and last hub of a route. Split on the segment separators the FMS
-    route strings use ('/', ';', ':', ','), take the ends. Returns codes where
-    the segment has one, else cleaned names — never empty when the route names
-    at least two places."""
-    segs = [s.strip() for s in re.split(r'\s*[/;:]\s*|\s*,\s*', route or "")
-            if s.strip()]
+    segs = route_segs(route)
     if not segs:
         return ("", "")
     if len(segs) == 1:
-        e = _seg_id(segs[0])
-        return (e, e)
-    return _seg_id(segs[0]), _seg_id(segs[-1])
+        return (segs[0], segs[0])
+    return segs[0], segs[-1]
 
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
@@ -124,6 +122,7 @@ def fetch_trips(plates: list[str], days: int, now: datetime) -> dict:
             by_veh[vno].append({
                 "rps": _first(rec, F_RPS),
                 "route": route, "origin": o, "dest": d,
+                "segs": route_segs(route),
                 "start_dt": _parse_dt(_first(rec, F_START)),
                 "end_dt": _parse_dt(_first(rec, F_END)),
             })
