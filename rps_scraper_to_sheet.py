@@ -71,6 +71,16 @@ _HUB_TRIP_SHEETS_NORM: dict[str, tuple[str, str]] = {
     k.strip().lower(): (k, v) for k, v in HUB_TRIP_SHEETS.items()
 }
 
+# The hub TRACKING workbooks (hub-only architecture) — the tracker's
+# Completed Trips ledgers live here now, read for GPS end times + lanes.
+HUB_TRACKING_SHEETS: dict[str, str] = {
+    "Ambala":       "1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE",
+    "Ambala Local": "1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ",
+    "Binola":       "1dagH3DjC4dXMQwVHVoE9mMJUQRPYEH6KDPc6OolLm5A",
+    "Binola Local": "15xvjwps6zuOP3ZKCPzsGRHUQuh24-4wh8Mm9tT8O-i8",
+    "G.Noida":      "16DgFINLCJ3-AUirn1MRSZS2LrrgO4LoudyzoMzaMk-U",
+}
+
 CREDS_FILE = Path(__file__).parent / "credentials.json"
 
 # ── V2: TEST-FIRST MODE ──────────────────────────────────────────────────────
@@ -1090,27 +1100,32 @@ def _load_master_extras(client):
         print(f"  [hublist] unreadable ({exc}) — codes limited to history",
               flush=True)
     index.sort(key=lambda t: -len(t[0]))
+    # the tracker's Completed Trips ledgers live PER HUB WORKBOOK now
+    # (hub-only architecture) — union all five
     ends = {}
     lanes = {}
-    try:
-        for r in _retry(master.worksheet(COMPLETED_TAB).get_all_records,
-                        _label="completed.read"):
-            rid = _normalize_rps(r.get("RPS_Number"))
-            if not rid or rid.upper() == "PREDICTED":
-                continue
-            raw = str(r.get("End_Time") or "").strip()
-            if raw:
-                try:
-                    ends[rid] = datetime.strptime(raw, "%d/%m/%Y %H:%M:%S")
-                except ValueError:
-                    pass
-            rc = str(r.get("Route_Code") or "").strip().upper()
-            if rc and "-" in rc:
-                fr, rest = rc.split("-", 1)
-                to = rest.split(";")[-1]
-                lanes[rid] = (fr.strip(), to.strip())
-    except Exception:
-        pass
+    for hub, sid in HUB_TRACKING_SHEETS.items():
+        try:
+            hss = _retry(client.open_by_key, sid, _label=f"open.completed.{hub}")
+            for r in _retry(hss.worksheet(COMPLETED_TAB).get_all_records,
+                            _label=f"completed.{hub}"):
+                rid = _normalize_rps(r.get("RPS_Number"))
+                if not rid or rid.upper() == "PREDICTED":
+                    continue
+                raw = str(r.get("End_Time") or "").strip()
+                if raw:
+                    try:
+                        ends[rid] = datetime.strptime(raw,
+                                                      "%d/%m/%Y %H:%M:%S")
+                    except ValueError:
+                        pass
+                rc = str(r.get("Route_Code") or "").strip().upper()
+                if rc and "-" in rc:
+                    fr, rest = rc.split("-", 1)
+                    lanes[rid] = (fr.strip(), rest.split(";")[-1].strip())
+        except Exception as exc:
+            print(f"  [completed] '{hub}' unreadable ({str(exc)[:50]})",
+                  flush=True)
     return codes, index, ends, lanes
 
 

@@ -51,3 +51,24 @@ def describe() -> str:
             f"  Vehicles tab   : {TAB_VEHICLES}\n"
             f"  Writes tabs    : {TAB_AMBALA}, {TAB_BINOLA}\n"
             f"  Hub List tab   : {TAB_HUB_LIST} (read from the master sheet)")
+
+
+# Per-hub tracking boards (hub-only architecture, 2026-08-29): the tracker
+# writes ONLY these workbooks; the master is read-only except Hub List rows.
+HUB_TRACKING_SHEETS = {
+    "Ambala":       "1xHxlccSE3z4cE-HqI8bh9Lwja7I_VkbkkTStWCcLvpE",
+    "Ambala Local": "1C9BePLnuPL1DfnNtuKheZ1uWu5j1ob_zoMXsXo0REgQ",
+    "Binola":       "1dagH3DjC4dXMQwVHVoE9mMJUQRPYEH6KDPc6OolLm5A",
+    "Binola Local": "15xvjwps6zuOP3ZKCPzsGRHUQuh24-4wh8Mm9tT8O-i8",
+    "G.Noida":      "16DgFINLCJ3-AUirn1MRSZS2LrrgO4LoudyzoMzaMk-U",
+}
+TAB_HUB_TRACKING = "Tracking"
+
+
+def assert_hub_tracking(sheet_id: str) -> str:
+    sid = (sheet_id or "").strip()
+    if sid not in HUB_TRACKING_SHEETS.values():
+        raise SheetLockError(
+            f"Refusing to touch spreadsheet {sid!r}: not in the hub-tracking "
+            f"whitelist.")
+    return sid

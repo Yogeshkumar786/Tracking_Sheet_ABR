@@ -92,7 +92,8 @@ def main():
 
     # -- universe: Vehicles tab rows with a hub, deduped, stable order -------
     veh = pre[config.TAB_VEHICLES]
-    universe, types, seen, branch = [], {}, set(), {}
+    _hub_canon = {k.strip().lower(): k for k in config.HUB_TRACKING_SHEETS}
+    universe, types, seen, branch, hub_of = [], {}, set(), {}, {}
     for v in veh:
         vno = (v.get("Vehicle No") or "").strip().upper()
         hub = (v.get("Vehicle Hub") or "").strip()
@@ -102,6 +103,9 @@ def main():
             universe.append(vno)
             types[vno] = (v.get("Vehicle Type") or "").strip()
             branch[vno] = b
+            ch = _hub_canon.get(hub.lower())
+            if ch:
+                hub_of[vno] = ch
     dupes = len(veh) - len(seen) - sum(1 for v in veh
                                        if not (v.get("Vehicle No") or "").strip()
                                        or not (v.get("Vehicle Hub") or "").strip())
@@ -124,6 +128,29 @@ def main():
         p = (r.get("Vehicle No") or "").strip().upper()
         if p and p not in existing_rows:
             existing_rows[p] = r
+    # per-hub workbooks: ONE batched read each for all four tabs. The hub
+    # team's Tracking edits OVERRIDE anything else for that hub's vehicles,
+    # and the other three tabs are the persistent stores the upserts merge
+    # into.
+    hub_ss, hub_order, hub_pre = {}, {}, {}
+    for hub in config.HUB_TRACKING_SHEETS:
+        try:
+            hss = sheetio.open_hub_sheet(hub)
+            hub_ss[hub] = hss
+            hp = sheetio.read_many(hss, [config.TAB_HUB_TRACKING,
+                                         "Extra Trips", "Completed Trips",
+                                         "Via Touching"])
+            hub_pre[hub] = hp
+            o = []
+            for r in hp.get(config.TAB_HUB_TRACKING, []):
+                p = (r.get("Vehicle No") or "").strip().upper()
+                if p:
+                    existing_rows[p] = r
+                    o.append(p)
+            hub_order[hub] = o
+        except Exception as exc:
+            print(f"  [Hub board] '{hub}' unreachable ({str(exc)[:50]}) — "
+                  f"skipped this run", flush=True)
     if existing_rows:
         print(f"  [Board] {len(existing_rows)} existing row(s) — manual edits "
               f"preserved", flush=True)
@@ -173,7 +200,8 @@ def main():
     # the latency. PRUNING: a truck that is rolling, far from its destination,
     # with every via verdict already final, cannot change anything this run —
     # its trail is not fetched at all.
-    viacur = pre[VIA_TAB] + [r for t in via_tabs for r in pre[t]]
+    viacur = pre[VIA_TAB] + [r for t in via_tabs for r in pre[t]] \
+        + [r for hp in hub_pre.values() for r in hp.get("Via Touching", [])]
     via_by_vt = {}
     for r in viacur:
         k = ((r.get("Vehicle No") or "").strip().upper(),
@@ -239,48 +267,58 @@ def main():
         print("\n  DRY RUN — nothing written.\n", flush=True)
         return
 
-    # ghost trips + real-trip ids, for the Extra Trips tabs
-    ghosts_by, reals = {}, {}
+    # ghost trips + real-trip ids
+    all_ghosts, reals = [], {}
     for r in rows:
-        b = branch.get(r["Vehicle No"])
-        if r.get("_ghost") is not None and b:
-            ghosts_by.setdefault(b, []).append((r["Vehicle No"], r["_ghost"]))
+        if r.get("_ghost") is not None:
+            all_ghosts.append((r["Vehicle No"], r["_ghost"]))
         real = r.get("_real")
         if real and real[1]:
             reals[r["Vehicle No"]] = real
 
-    batch = _Batch(ss)
-    for name, _ in hm.REPORTS:
-        brows = [r for r in rows if branch.get(r["Vehicle No"]) == name]
-        _write(ss, f"{name} Tracker", brows, now, batch)
-    for name, _ in hm.REPORTS:
-        _extra_write(ss, f"{name} Extra Trips", ghosts_by.get(name, []),
-                     reals, now, batch, cur=pre[f"{name} Extra Trips"])
-    _completed_write(ss, types, hubs, index, sheet_tats, rows, now, batch,
-                     cur=pre[TAB_COMPLETED])
-    for name, _ in hm.REPORTS:
-        vrows = [r for r in rows if branch.get(r["Vehicle No"]) == name]
-        legacy = [r for r in pre[VIA_TAB]
-                  if branch.get((r.get("Vehicle No") or "").strip().upper())
-                  == name]
-        _via_write(ss, f"{name} Via Touching", vrows, now, batch,
-                   cur=pre[f"{name} Via Touching"] + legacy)
-    batch.flush()
-    _lap("write everything back (2 calls)")
+    # ── EVERYTHING lives on the HUB workbooks (user decision 2026-08-29):
+    # the master is READ-ONLY for the tracker — Hub List (+ pending-pin
+    # rows) and the Vehicles list only. Each hub workbook is the persistent
+    # home of its own Tracking board, Extra Trips, Completed Trips and Via
+    # Touching, upserted with the same rules as before.
+    unassigned = [r["Vehicle No"] for r in rows
+                  if r["Vehicle No"] not in hub_of]
+    if unassigned:
+        print(f"  [Hub board] {len(unassigned)} vehicle(s) whose Vehicle Hub "
+              f"matches no hub workbook — on no board: "
+              + ", ".join(unassigned[:8])
+              + ("…" if len(unassigned) > 8 else ""), flush=True)
+    for hub, hss in hub_ss.items():
+        hpre = hub_pre.get(hub, {})
+        kept = [p for p in hub_order.get(hub, []) if hub_of.get(p) == hub]
+        keptset = set(kept)
+        hrows_by = {r["Vehicle No"]: r for r in rows
+                    if hub_of.get(r["Vehicle No"]) == hub}
+        ordered_h = [hrows_by[p] for p in kept if p in hrows_by] \
+            + [r for p, r in hrows_by.items() if p not in keptset]
+        hrows = list(hrows_by.values())
+        hb = _Batch(hss)
+        _write(hss, config.TAB_HUB_TRACKING, ordered_h, now, hb)
+        _extra_write(hss, "Extra Trips",
+                     [(v, g) for v, g in all_ghosts if hub_of.get(v) == hub],
+                     reals, now, hb, cur=hpre.get("Extra Trips", []))
+        _completed_write(hss, types, hubs, index, sheet_tats, hrows, now, hb,
+                         cur=hpre.get("Completed Trips", []))
+        _via_write(hss, "Via Touching", hrows, now, hb,
+                   cur=hpre.get("Via Touching", []))
+        hb.flush()
+        print(f"  [Hub board] '{hub}': {len(ordered_h)} vehicle(s) — "
+              f"tracking/extra/completed/via written", flush=True)
+    _lap("write everything back (per hub)")
     _tot = sum(x for _, x in _timing)
     print(f"\n  [Timing] {_tot:.0f}s total — where the time went:", flush=True)
     for _lb, _sc in _timing:
         _bar = "#" * max(1, int(round(_sc / _tot * 34)))
         print(f"    {_lb:<48} {_sc:6.1f}s {_sc / _tot * 100:3.0f}%  {_bar}",
               flush=True)
+    # the ONLY master write left: pending-hub rows appended to the Hub List
+    # (the Hub List lives on the master by the user's rule)
     _request_pending_hubs(ss, hubs, rows, trips_by, now)
-    # retire superseded tabs so a stale copy can't mislead
-    for _old in (TAB_OLD, VIA_TAB):
-        try:
-            ss.del_worksheet(sheetio.find_tab(ss, _old))
-            print(f"  [Sheet] removed superseded '{_old}' tab", flush=True)
-        except Exception:
-            pass
     print("\n  Done.\n", flush=True)
 
 
@@ -356,6 +394,20 @@ def _hdr_fmt():
     from tracking_suite.sheetio import HEADER_BG, HEADER_FG
     return {"backgroundColor": HEADER_BG,
             "textFormat": {"bold": True, "foregroundColor": HEADER_FG}}
+
+
+def _mirror(hss, hb, title, headers, rows, dur_cols=()):
+    """Read-only per-hub mirror tab: full overwrite each run, padded so a
+    shrinking list never leaves stale rows."""
+    ws = sheetio.get_or_create(hss, title, len(headers), len(rows) + 20)
+    matrix = [list(headers)] + [[r.get(h, "") for h in headers] for r in rows]
+    matrix += [[""] * len(headers) for _ in range(40)]
+    hb.add_values(title, matrix)
+    for col in dur_cols:
+        c = headers.index(col)
+        hb.fmt(ws.id, 1, len(rows) + 40, c, c + 1, _DUR_FMT, _F_DUR)
+    hb.fmt(ws.id, 0, 1, 0, len(headers), _hdr_fmt(), _F_HDR)
+    hb.freeze(ws.id)
 
 
 def _write(ss, title, rows, now, batch):
@@ -593,6 +645,7 @@ def _extra_write(ss, title, ghosts, reals, now, batch, cur=None):
     batch.freeze(ws.id)
     print(f"  [Sheet] '{title}': {len(rows)} ghost trip(s) queued",
           flush=True)
+    return rows
 
 
 # ── Completed Trips — every finished trip, filed or predicted, no duplicates ─
@@ -753,6 +806,7 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now,
     batch.freeze(ws.id)
     print(f"  [Sheet] '{TAB_COMPLETED}': {len(out)} tracker-completed trip(s) "
           f"queued", flush=True)
+    return out
 
 
 # ── Pending hubs — an unknown via becomes a Hub List row the human finishes ──
@@ -995,6 +1049,7 @@ def _via_write(ss, title, rows, now, batch, cur=None):
                       "userEnteredFormat.backgroundColor")
     print(f"  [Sheet] '{title}': {len(out)} via visit(s) queued "
           f"({n_new} new)", flush=True)
+    return out
 
 
 if __name__ == "__main__":

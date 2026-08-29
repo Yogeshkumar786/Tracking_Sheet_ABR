@@ -133,6 +133,13 @@ def _ws_list(ss):
     return _ws_memo[key]
 
 
+def open_hub_sheet(hub: str):
+    """Open a hub's own tracking workbook — whitelist-checked, same client."""
+    sid = config.assert_hub_tracking(config.HUB_TRACKING_SHEETS.get(hub, ""))
+    return _with_quota_retry(lambda: client().open_by_key(sid),
+                             f"open hub '{hub}'")
+
+
 def find_tab(ss, name: str):
     """Find a tab by name, tolerating stray case and surrounding whitespace.
 
