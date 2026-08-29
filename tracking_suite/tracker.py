@@ -40,11 +40,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from statistics import median
 
 from tracking_suite import fms
 from tracking_suite import estimator
 from tracking_suite import ghost as ghostmod
+from tracking_suite import viatouch
 from tracking_suite.presence import haversine_m
 
 # ── board vocabulary (unchanged) ─────────────────────────────────────────────
@@ -108,6 +110,17 @@ def _same_trip_id(a: str, b: str) -> bool:
     nb = (b or "").strip().lstrip("0")
     return na == nb and na != ""
 _CODE_RE = re.compile(r'\(([A-Za-z0-9]{2,8})\)')
+
+
+def via_codes(cell: str) -> list:
+    """Via hub codes out of a Via Point cell — plain ('TAU11, JPR11') or
+    annotated with timings ('TAU11 09:30→11:15 ✓ · JPR11 pending')."""
+    out = []
+    for part in re.split(r'[·,]', cell or ""):
+        tok = part.strip().split()
+        if tok and re.fullmatch(r'[A-Z0-9]{3,10}', tok[0]):
+            out.append(tok[0])
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -250,6 +263,28 @@ class Atlas:
         self.cluster = hubs["cluster"]
         self.radius = hubs["radius"]
         self.index = index
+        self.pending = hubs.get("pending", set())
+        self.vstatus = hubs.get("vstatus", {})
+        # spatial grid (~2.2 km cells): "nearest hub to this point" becomes a
+        # 9-cell lookup instead of a 477-hub scan — the ghost detector walks
+        # thousands of trail points through this
+        self._cell = 0.02
+        self._grid: dict = {}
+        for code, (la, lo) in self.by_code.items():
+            k = (int(la / self._cell), int(lo / self._cell))
+            self._grid.setdefault(k, []).append((code, la, lo))
+
+    def nearest(self, lat: float, lon: float):
+        """(code, dist_m) of the nearest hub within ~2 km, else ("", inf)."""
+        cx, cy = int(lat / self._cell), int(lon / self._cell)
+        best, bd = "", float("inf")
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for code, la, lo in self._grid.get((cx + dx, cy + dy), ()):
+                    d = haversine_m(lat, lon, la, lo)
+                    if d < bd:
+                        best, bd = code, d
+        return best, bd
 
     def region(self, code: str) -> str:
         return self.cluster.get(code, code) if code else ""
@@ -273,11 +308,7 @@ class Atlas:
     def place_of(self, fix: Fix, loc_text: str) -> Place:
         """Where is this vehicle? One answer, one method chain."""
         if fix.fresh:
-            best, bd = "", 1e12
-            for code, (hl, ho) in self.by_code.items():
-                d = haversine_m(fix.lat, fix.lon, hl, ho)
-                if d < bd:
-                    best, bd = code, d
+            best, bd = self.nearest(fix.lat, fix.lon)
             if best and bd <= self.rad(best):
                 return Place(best, self.region(best), best, "pin")
         m = _CODE_RE.search(loc_text or "")
@@ -318,27 +349,77 @@ def _ping_dt(p):
     return None
 
 
-def fetch_trail(live: dict, now: datetime, hours: float = TRAIL_HOURS) -> list:
-    try:
-        vid = int(live.get("vehicleId"))
-    except (TypeError, ValueError):
-        return []
+_TRAIL_CACHE = Path(__file__).resolve().parent / ".cache" / "trails"
+_TRAIL_KEEP_H = 24 * 7.0
+
+
+def _fetch_range(vid: int, frm: datetime, to: datetime) -> list:
     pts = []
-    for p in fms.tracking_report(vid, now - timedelta(hours=hours), now):
+    for p in fms.tracking_report(vid, frm, to):
         try:
             la, lo = float(p.get("latitude") or 0), float(p.get("longitude") or 0)
         except (TypeError, ValueError):
             continue
         dt = _ping_dt(p)
-        if la and lo and dt and dt <= now + timedelta(minutes=5):
+        if la and lo and dt and dt <= to + timedelta(minutes=5):
             pts.append((dt, la, lo))
+    return pts
+
+
+def fetch_trail(live: dict, now: datetime, hours: float = TRAIL_HOURS) -> list:
+    """Position history for the window — INCREMENTALLY. Consecutive runs
+    overlap almost entirely, so pings are cached on disk per vehicle and only
+    the missing edges (newer than the cache, or older when the window grows)
+    are fetched from FMS. Cold cache = one full fetch, same as before."""
+    try:
+        vid = int(live.get("vehicleId"))
+    except (TypeError, ValueError):
+        return []
+    win_start = now - timedelta(hours=hours)
+    cachef = _TRAIL_CACHE / f"{vid}.json"
+    cached: list = []
+    try:
+        import json as _json
+        raw = _json.loads(cachef.read_text(encoding="utf-8"))
+        cached = [(datetime.fromisoformat(t), la, lo) for t, la, lo in raw]
+    except Exception:
+        cached = []
+    keep_from = now - timedelta(hours=_TRAIL_KEEP_H)
+    cached = [p for p in cached if p[0] >= keep_from]
+
+    # the dashboard already says when this truck LAST sent GPS — if our cache
+    # already ends there, the server has nothing new: skip the call entirely.
+    # Guards: only trusted when the timestamp exists and is under 6h old
+    # (silent/REVIEW trucks always get a real fetch to double-check).
+    hint = fms.last_gps_dt(live)
+    up_to_date = bool(
+        cached and hint and (now - hint) < timedelta(hours=FRESH_HRS)
+        and cached[-1][0] >= hint - timedelta(seconds=90))
+
+    pts = list(cached)
+    if cached:
+        # newer edge: everything since the last cached ping
+        if not up_to_date and now - cached[-1][0] > timedelta(minutes=2):
+            pts += _fetch_range(vid, cached[-1][0], now)
+        # older edge: the window reaches further back than the cache does
+        if cached[0][0] - win_start > timedelta(minutes=30):
+            pts += _fetch_range(vid, win_start, cached[0][0])
+    else:
+        pts = _fetch_range(vid, win_start, now)
+
     pts.sort()
-    # drop non-monotonic duplicates
     out = []
     for p in pts:
         if not out or p[0] > out[-1][0]:
             out.append(p)
-    return out
+    try:
+        import json as _json
+        _TRAIL_CACHE.mkdir(parents=True, exist_ok=True)
+        cachef.write_text(_json.dumps(
+            [[p[0].isoformat(), p[1], p[2]] for p in out]), encoding="utf-8")
+    except Exception:
+        pass
+    return [p for p in out if p[0] >= win_start]
 
 
 def stay_at(trail: list, hlat: float, hlon: float, radius_m: float):
@@ -556,7 +637,9 @@ def _hhmm(minutes: float) -> str:
 
 def build_row(vno: str, vtype: str, live: dict | None, trips: list,
               hubs: dict, index: list, tats: dict, existing: dict,
-              now: datetime, sheet_tats: dict | None = None) -> dict:
+              now: datetime, sheet_tats: dict | None = None,
+              pre_trail: list | None = None,
+              via_prior: list | None = None) -> dict:
     atlas = Atlas(hubs, index)
     ev = Evidence()
     row = {h: "" for h in HEADERS}
@@ -630,9 +713,7 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
             pass
         trip.origin = trip.origin or (existing.get("From") or "").strip()
         trip.dest = (existing.get("To") or "").strip()
-        trip.vias = trip.vias or [v.strip() for v in
-                                  (existing.get("Via Point") or "").split(",")
-                                  if v.strip()]
+        trip.vias = trip.vias or via_codes(existing.get("Via Point") or "")
         trip.dep = trip.dep or pdep
         trip.trip_id = trip.trip_id or "PREDICTED"
         trip.source = trip.source or "ghost"
@@ -646,9 +727,11 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
     here = atlas.place_of(fix, loc_text)
     row["Current Location"] = here.label
 
-    # 3 · trail + motion (fetched only when it can change a verdict)
-    trail = []
-    if trip.active and fix.fresh:
+    # 3 · trail + motion. The runner usually hands the trail in (prefetched
+    # in parallel); the lazy fetches below remain as fallback for the rare
+    # vehicle the prefetch pass didn't anticipate.
+    trail = list(pre_trail) if pre_trail else []
+    if not trail and pre_trail is None and trip.active and fix.fresh:
         near_pts = [c for c in ([trip.dest] + trip.vias) if c in atlas.by_code]
         near = any(haversine_m(fix.lat, fix.lon, *atlas.by_code[c])
                    <= VIA_NEAR_KM * 1000 for c in near_pts)
@@ -722,23 +805,47 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
     if arrived:
         row["Actual Arrival Date&Time"] = arrived.strftime(_DT_OUT)
 
-    # 6 · via — same authority, same gates
+    # 6 · vias — the touching engine (viatouch.py). One verdict per via, in
+    # route order, hiccup-tolerant: clean stays CONFIRMED, gap-edged stays
+    # INTERPOLATED, blackout passages INFERRED from geometry + time budget.
     at_via = ""
-    if trip.active and not arrived and fix.fresh:
-        for vc in trip.vias:
-            if vc in atlas.by_code:
-                vlat, vlon = atlas.by_code[vc]
-                if haversine_m(fix.lat, fix.lon, vlat, vlon) <= atlas.rad(vc):
-                    entered, exited = stay_at(trail, vlat, vlon, atlas.rad(vc))
-                    entered = check_event(entered, trip.dep, now, fix, "via entry", ev)
-                    at_via = vc
-                    if entered and not exited:
-                        ev.note(f"at via {vc} since {entered:%H:%M} (est)")
-                    break
-                entered, exited = stay_at(trail, vlat, vlon, atlas.rad(vc))
-                entered = check_event(entered, trip.dep, now, fix, "via entry", ev)
-                if entered and exited:
-                    ev.log(f"via {vc} {entered:%H:%M}->{exited:%H:%M} (est)")
+    if trip.active and trip.vias and fix.fresh:
+        if not trail:
+            hrs = TRAIL_HOURS
+            if trip.dep and (now - trip.dep).total_seconds() \
+                    > TRAIL_HOURS * 3600:
+                hrs = TRAIL_EXT_HOURS
+            trail = fetch_trail(live, now, hours=hrs)
+        if not trail and via_prior:
+            # pruned run: no fresh trail, but the tab already holds final
+            # verdicts — display them instead of pretending "no data"
+            visits = viatouch.from_rows(via_prior, trip.vias)
+        else:
+            visits = viatouch.assess(trip.vias, trail, atlas, trip.dep, now)
+        row["_vias"] = visits
+        parts = []
+        for v in visits:
+            if v.result == "at via now":
+                at_via = v.via
+                parts.append(f"{v.via} {v.entry:%H:%M}→…")
+                ev.note(f"at via {v.via} since {v.entry:%H:%M} "
+                        f"({v.confidence.lower()})")
+            elif v.result in ("stopped", "stopped (in GPS gap)") \
+                    and v.entry and v.exit:
+                mark = "✓" if v.confidence == "CONFIRMED" else "est"
+                parts.append(f"{v.via} {v.entry:%H:%M}→{v.exit:%H:%M} {mark}")
+                ev.log(f"via {v.via} {v.entry:%d/%m %H:%M}->{v.exit:%H:%M} "
+                       f"dwell {v.dwell_h:.1f}h ({v.confidence.lower()})")
+            elif v.result == "passed through" and v.entry:
+                parts.append(f"{v.via} ~{v.entry:%H:%M} pass")
+            elif v.result == "not reached":
+                parts.append(f"{v.via} pending")
+            elif v.result in ("pending hub", "unknown hub"):
+                parts.append(f"{v.via} ⚠ add pin")
+            else:
+                parts.append(f"{v.via} ?")
+        if parts:
+            row["Via Point"] = " · ".join(parts)
 
     # 7 · state machine — one decision, monotonic
     if arrived:
@@ -838,7 +945,9 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
         row["_trust"] = "pred"
     elif row["Status"] == S_REVIEW or "unverified" in mach \
             or "(est" in mach or "est +" in mach or "no fix" in mach \
-            or "may have STOPPED" in mach:
+            or "may have STOPPED" in mach \
+            or any(v.confidence in ("INTERPOLATED", "INFERRED")
+                   for v in (row.get("_vias") or [])):
         row["_trust"] = "est"
     else:
         row["_trust"] = "ok"

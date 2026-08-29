@@ -52,8 +52,6 @@ def service_account_email() -> str:
 
 
 def _creds() -> Credentials:
-    """Prefer the GOOGLE_CREDENTIALS_JSON secret (cloud); fall back to the
-    local credentials file."""
     raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
     if raw:
         return Credentials.from_service_account_info(json.loads(raw),
@@ -80,10 +78,17 @@ def _with_quota_retry(fn, what: str):
         try:
             return fn()
         except gspread.exceptions.APIError as exc:
-            if "429" in str(exc) and attempt < 2:
+            s = str(exc)
+            if "429" in s and attempt < 2:
                 wait = 65 * (attempt + 1)
                 print(f"  [Quota] 429 on {what} — waiting {wait}s "
                       f"(shared service account)", flush=True)
+                time.sleep(wait)
+                continue
+            if any(f"[{c}]" in s for c in (500, 502, 503)) and attempt < 2:
+                wait = 15 * (attempt + 1)
+                print(f"  [Net] Google 5xx on {what} — retrying in {wait}s",
+                      flush=True)
                 time.sleep(wait)
                 continue
             raise
@@ -115,6 +120,19 @@ def open_sheet(sheet_id: str | None = None):
         ) from exc
 
 
+# One metadata fetch per spreadsheet per run — every find_tab used to make its
+# own worksheets() API call (a quota hit each), for a tab list that changes at
+# most once per run (when WE add a tab, which updates the memo directly).
+_ws_memo: dict = {}
+
+
+def _ws_list(ss):
+    key = ss.id
+    if key not in _ws_memo:
+        _ws_memo[key] = _with_quota_retry(ss.worksheets, "list tabs")
+    return _ws_memo[key]
+
+
 def find_tab(ss, name: str):
     """Find a tab by name, tolerating stray case and surrounding whitespace.
 
@@ -123,12 +141,12 @@ def find_tab(ss, name: str):
     wrong fix — so match loosely and use whatever is actually there.
     """
     want = (name or "").strip().casefold()
-    for ws in _with_quota_retry(ss.worksheets, "list tabs"):
+    for ws in _ws_list(ss):
         if ws.title.strip().casefold() == want:
             return ws
     raise RuntimeError(
         f"Tab {name!r} not found in {ss.title!r}. "
-        f"Tabs present: {[w.title for w in ss.worksheets()]}"
+        f"Tabs present: {[w.title for w in _ws_list(ss)]}"
     )
 
 
@@ -136,7 +154,11 @@ def get_or_create(ss, title: str, ncols: int, nrows: int = 100):
     try:
         return find_tab(ss, title)
     except RuntimeError:
-        return ss.add_worksheet(title=title, rows=max(nrows, 100), cols=max(ncols, 10))
+        ws = ss.add_worksheet(title=title, rows=max(nrows, 100),
+                              cols=max(ncols, 10))
+        if ss.id in _ws_memo:
+            _ws_memo[ss.id].append(ws)
+        return ws
 
 
 def col_a1(idx0: int) -> str:
@@ -155,10 +177,7 @@ def read_rows(ss, tab: str) -> list[list]:
                              f"read '{tab}'")
 
 
-def read_records(ss, tab: str) -> list[dict]:
-    """Rows as dicts keyed by header name, so a column inserted by hand in the
-    UI does not shift anything. Headers are stripped of stray whitespace."""
-    rows = read_rows(ss, tab)
+def _to_records(rows: list) -> list[dict]:
     if not rows:
         return []
     headers = [h.strip() for h in rows[0]]
@@ -171,6 +190,36 @@ def read_records(ss, tab: str) -> list[dict]:
             if h:
                 rec[h] = (r[i].strip() if i < len(r) and r[i] is not None else "")
         out.append(rec)
+    return out
+
+
+def read_records(ss, tab: str) -> list[dict]:
+    """Rows as dicts keyed by header name, so a column inserted by hand in the
+    UI does not shift anything. Headers are stripped of stray whitespace."""
+    return _to_records(read_rows(ss, tab))
+
+
+def read_many(ss, tabs: list) -> dict:
+    """{tab_name: records} for many tabs in ONE values.batchGet API call —
+    ten startup reads collapse to one, which is what stops the 429 collisions
+    with the hourly cloud job. A tab that does not exist yet maps to []."""
+    have = {}
+    for want in tabs:
+        w = (want or "").strip().casefold()
+        for ws in _ws_list(ss):
+            if ws.title.strip().casefold() == w:
+                have[want] = ws.title
+                break
+    if not have:
+        return {t: [] for t in tabs}
+    titles = list(have.values())
+    resp = _with_quota_retry(
+        lambda: ss.values_batch_get([f"'{t}'" for t in titles]),
+        f"batch read {len(titles)} tab(s)")
+    ranges = resp.get("valueRanges", [])
+    out = {t: [] for t in tabs}
+    for want, vr in zip(have.keys(), ranges):
+        out[want] = _to_records(vr.get("values") or [])
     return out
 
 

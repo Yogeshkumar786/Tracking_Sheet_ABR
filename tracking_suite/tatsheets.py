@@ -70,13 +70,32 @@ def _endpoints(route_code: str) -> tuple:
     return codes[0], codes[-1]
 
 
+_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".cache", "tats.json")
+_CACHE_TTL_H = 6.0
+
+
 def load_sheet_tats(cluster: dict, months: int = 2) -> dict:
     """Read Route_TAT from the newest `months` MIS tabs of each trip sheet.
 
     Returns {"exact": {(O_CODE, D_CODE): hours}, "region": {(o_reg, d_reg): hours}}
     using the MOST COMMON value per lane — these are operational standards, so
     the mode is the standard and outliers are data-entry noise.
-    """
+
+    Cached on disk for 6 hours: the sheets change ~monthly, and skipping their
+    9 Google reads most runs is a large share of the quota pressure."""
+    import time
+    try:
+        raw = json.loads(open(_CACHE_FILE, encoding="utf-8").read())
+        if time.time() - raw["ts"] <= _CACHE_TTL_H * 3600:
+            out = {"exact": {tuple(k.split("|")): v
+                             for k, v in raw["exact"].items()},
+                   "region": {tuple(k.split("|")): v
+                              for k, v in raw["region"].items()}}
+            print(f"  [TAT-sheet] {len(out['exact'])} exact lane TAT(s) "
+                  f"from cache", flush=True)
+            return out
+    except Exception:
+        pass
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
     if raw:                       # cloud: the GitHub Actions secret
@@ -130,4 +149,15 @@ def load_sheet_tats(cluster: dict, months: int = 2) -> dict:
     out_r = {k: c.most_common(1)[0][0] for k, c in region.items()}
     print(f"  [TAT-sheet] {len(out_e)} exact lane TAT(s) from {read} MIS tab(s) "
           f"(read-only)", flush=True)
+    if read >= 4:      # don't cache a quota-crippled partial read
+        try:
+            import time
+            os.makedirs(os.path.dirname(_CACHE_FILE), exist_ok=True)
+            with open(_CACHE_FILE, "w", encoding="utf-8") as fh:
+                json.dump({"ts": time.time(),
+                           "exact": {"|".join(k): v for k, v in out_e.items()},
+                           "region": {"|".join(k): v
+                                      for k, v in out_r.items()}}, fh)
+        except Exception:
+            pass
     return {"exact": out_e, "region": out_r}

@@ -48,11 +48,7 @@ class Ghost:
 
 
 def _hub_at(atlas, lat: float, lon: float) -> str:
-    best, bd = "", 1e12
-    for code, (hl, ho) in atlas.by_code.items():
-        d = haversine_m(lat, lon, hl, ho)
-        if d < bd:
-            best, bd = code, d
+    best, bd = atlas.nearest(lat, lon)   # grid lookup, not a 477-hub scan
     return best if best and bd <= atlas.rad(best) else ""
 
 

@@ -58,12 +58,40 @@ def main():
     print(config.describe(), flush=True)
     print(f"  {'-' * 70}", flush=True)
 
+    # built-in stopwatch: every phase laps itself, breakdown printed at the end
+    import time as _clock
+    _timing = []
+    _tw = _clock.perf_counter()
+
+    def _lap(label):
+        nonlocal _tw
+        t = _clock.perf_counter()
+        _timing.append((label, t - _tw))
+        _tw = t
+
     ss = sheetio.open_sheet()
-    hubs = hublist.load(ss)
+    # ONE batched read for every tab this run needs — ten API calls become
+    # one, which is what stops the 429 collisions with the hourly cloud job.
+    # The Google read and the FMS dashboard call are independent, so they run
+    # AT THE SAME TIME: startup costs the slower of the two, not the sum.
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    board_tabs = [f"{n} Tracker" for n, _ in hm.REPORTS]
+    extra_tabs = [f"{n} Extra Trips" for n, _ in hm.REPORTS]
+    via_tabs = [f"{n} Via Touching" for n, _ in hm.REPORTS]
+    with _TPE(max_workers=2) as _ex:
+        _fpre = _ex.submit(sheetio.read_many, ss,
+                           [config.TAB_HUB_LIST, config.TAB_VEHICLES,
+                            TAB_OLD, TAB_COMPLETED, VIA_TAB]
+                           + board_tabs + extra_tabs + via_tabs)
+        _flive = _ex.submit(fms.live_vehicles)
+        pre = _fpre.result()
+        _live_list = _flive.result()
+    hubs = hublist.load(ss, rows=pre[config.TAB_HUB_LIST])
     index = tracker.build_index(hubs["names"])
+    _lap("open + read all sheets / FMS dashboard (together)")
 
     # -- universe: Vehicles tab rows with a hub, deduped, stable order -------
-    veh = sheetio.read_records(ss, config.TAB_VEHICLES)
+    veh = pre[config.TAB_VEHICLES]
     universe, types, seen, branch = [], {}, set(), {}
     for v in veh:
         vno = (v.get("Vehicle No") or "").strip().upper()
@@ -85,24 +113,17 @@ def main():
     # -- existing boards: preserve human edits + per-tab row order -----------
     existing_rows, tab_order = {}, {}
     for name, _ in hm.REPORTS:
-        try:
-            cur = sheetio.read_records(ss, f"{name} Tracker")
-            o = []
-            for r in cur:
-                p = (r.get("Vehicle No") or "").strip().upper()
-                if p:
-                    existing_rows[p] = r
-                    o.append(p)
-            tab_order[name] = o
-        except RuntimeError:
-            tab_order[name] = []
-    try:  # migrate manual edits from the superseded single board, once
-        for r in sheetio.read_records(ss, TAB_OLD):
+        o = []
+        for r in pre[f"{name} Tracker"]:
             p = (r.get("Vehicle No") or "").strip().upper()
-            if p and p not in existing_rows:
+            if p:
                 existing_rows[p] = r
-    except RuntimeError:
-        pass
+                o.append(p)
+        tab_order[name] = o
+    for r in pre[TAB_OLD]:  # migrate from the superseded single board, once
+        p = (r.get("Vehicle No") or "").strip().upper()
+        if p and p not in existing_rows:
+            existing_rows[p] = r
     if existing_rows:
         print(f"  [Board] {len(existing_rows)} existing row(s) — manual edits "
               f"preserved", flush=True)
@@ -116,33 +137,102 @@ def main():
         ordered += kept + new
 
     # -- data ----------------------------------------------------------------
-    live_by = {fms.veh_no(v): v for v in fms.live_vehicles()}
-    trips_by = routes.fetch_trips(universe, args.days, now)
+    # RPS history and the trip-sheet TATs are independent too — fetched at
+    # the same time (the TAT side is usually a cache hit and returns at once)
+    live_by = {fms.veh_no(v): v for v in _live_list}
+    with _TPE(max_workers=2) as _ex:
+        _ftrips = _ex.submit(routes.fetch_trips, universe, args.days, now)
+        _ftats = _ex.submit(tatsheets.load_sheet_tats, hubs["cluster"])
+        trips_by = _ftrips.result()
+        try:
+            sheet_tats = _ftats.result()
+        except Exception as exc:
+            print(f"  [TAT-sheet] unavailable ({str(exc)[:60]}) — using "
+                  f"history", flush=True)
+            sheet_tats = None
+    _lap("45-day trip history / trip-sheet TATs (together)")
+    # a human may have pasted coordinates into a PENDING hub row — finish it
+    # now so THIS run can already time vias against the new pin
+    if not args.dry_run and _complete_pending_hubs(ss, live_by, trips_by, now):
+        hubs = hublist.load(ss)
+        index = tracker.build_index(hubs["names"])
     tats = tracker.learn_tats(trips_by, hubs["cluster"])
     print(f"  [TAT] {len(tats)} lane timetable(s) learned from trip history",
           flush=True)
-    try:
-        sheet_tats = tatsheets.load_sheet_tats(hubs["cluster"])
-    except Exception as exc:
-        print(f"  [TAT-sheet] unavailable ({str(exc)[:60]}) — using history",
-              flush=True)
-        sheet_tats = None
+    _lap("pending-hub check + TAT learning")
 
-    # -- build rows (only FMS-tracked vehicles; trail calls where needed) ----
+    # -- build rows (only FMS-tracked vehicles) ------------------------------
     on_fms = [p for p in ordered if p in live_by]
     skipped = len(ordered) - len(on_fms)
     if skipped:
         print(f"  [Skip] {skipped} vehicle(s) not on the FMS dashboard — not shown",
               flush=True)
+
+    # -- prefetch GPS trails IN PARALLEL (the single biggest time saver) -----
+    # Sequential trail calls were ~5 min against a slow FMS; 8 workers overlap
+    # the latency. PRUNING: a truck that is rolling, far from its destination,
+    # with every via verdict already final, cannot change anything this run —
+    # its trail is not fetched at all.
+    viacur = pre[VIA_TAB] + [r for t in via_tabs for r in pre[t]]
+    via_by_vt = {}
+    for r in viacur:
+        k = ((r.get("Vehicle No") or "").strip().upper(),
+             str(r.get("Trip ID") or "").strip().lstrip("0"))
+        via_by_vt.setdefault(k, []).append(r)
+
+    def _vias_final(vno, live):
+        tid = (fms.current_rps(live) or "").strip().lstrip("0")
+        rws = via_by_vt.get((vno, tid), [])
+        return bool(rws) and all(
+            (r.get("Result") or "").strip() in _FINAL_RESULTS for r in rws)
+
+    need, pruned = [], 0
+    for vno in on_fms:
+        live = live_by[vno]
+        on = fms.on_trip(live) or bool(
+            (existing_rows.get(vno, {}).get("Trip ID") or "").strip())
+        if not on and trips_by.get(vno):
+            r0 = trips_by[vno][0]
+            on = bool(r0.get("start_dt") and not r0.get("end_dt")
+                      and (now - r0["start_dt"]).days < 7)
+        if on:
+            if fms.running(live) and (fms.remaining_km(live) or 0) > 100 \
+                    and _vias_final(vno, live):
+                pruned += 1
+                continue
+            need.append(vno)
+        elif fms.running(live):
+            need.append(vno)          # possible ghost trip: needs its trail
+    trails = {}
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch_one(v):
+        try:
+            return v, tracker.fetch_trail(live_by[v], now)
+        except Exception:
+            return v, []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for v, t in ex.map(_fetch_one, need):
+            trails[v] = t
+    print(f"  [Trail] {len(need)} trail(s) prefetched in parallel"
+          + (f", {pruned} pruned (nothing can change)" if pruned else ""),
+          flush=True)
+    _lap("GPS trails, 8 at a time")
+
     rows = []
     for i, vno in enumerate(on_fms, 1):
-        row = tracker.build_row(vno, types.get(vno, ""), live_by[vno],
+        live = live_by[vno]
+        tid = (fms.current_rps(live) or "").strip().lstrip("0")
+        row = tracker.build_row(vno, types.get(vno, ""), live,
                                 trips_by.get(vno, []), hubs, index, tats,
                                 existing_rows.get(vno, {}), now,
-                                sheet_tats=sheet_tats)
+                                sheet_tats=sheet_tats,
+                                pre_trail=trails.get(vno),
+                                via_prior=via_by_vt.get((vno, tid)))
         rows.append(row)
         if i % 40 == 0:
             print(f"    [{i}/{len(on_fms)}]", flush=True)
+    _lap("thinking: build all 201 rows")
 
     _report(rows)
     if args.dry_run:
@@ -159,19 +249,38 @@ def main():
         if real and real[1]:
             reals[r["Vehicle No"]] = real
 
+    batch = _Batch(ss)
     for name, _ in hm.REPORTS:
         brows = [r for r in rows if branch.get(r["Vehicle No"]) == name]
-        _write(ss, f"{name} Tracker", brows, now)
+        _write(ss, f"{name} Tracker", brows, now, batch)
     for name, _ in hm.REPORTS:
         _extra_write(ss, f"{name} Extra Trips", ghosts_by.get(name, []),
-                     reals, now)
-    _completed_write(ss, types, hubs, index, sheet_tats, rows, now)
-    # retire the superseded single board so a stale copy can't mislead
-    try:
-        ss.del_worksheet(sheetio.find_tab(ss, TAB_OLD))
-        print(f"  [Sheet] removed superseded '{TAB_OLD}' tab", flush=True)
-    except Exception:
-        pass
+                     reals, now, batch, cur=pre[f"{name} Extra Trips"])
+    _completed_write(ss, types, hubs, index, sheet_tats, rows, now, batch,
+                     cur=pre[TAB_COMPLETED])
+    for name, _ in hm.REPORTS:
+        vrows = [r for r in rows if branch.get(r["Vehicle No"]) == name]
+        legacy = [r for r in pre[VIA_TAB]
+                  if branch.get((r.get("Vehicle No") or "").strip().upper())
+                  == name]
+        _via_write(ss, f"{name} Via Touching", vrows, now, batch,
+                   cur=pre[f"{name} Via Touching"] + legacy)
+    batch.flush()
+    _lap("write everything back (2 calls)")
+    _tot = sum(x for _, x in _timing)
+    print(f"\n  [Timing] {_tot:.0f}s total — where the time went:", flush=True)
+    for _lb, _sc in _timing:
+        _bar = "#" * max(1, int(round(_sc / _tot * 34)))
+        print(f"    {_lb:<48} {_sc:6.1f}s {_sc / _tot * 100:3.0f}%  {_bar}",
+              flush=True)
+    _request_pending_hubs(ss, hubs, rows, trips_by, now)
+    # retire superseded tabs so a stale copy can't mislead
+    for _old in (TAB_OLD, VIA_TAB):
+        try:
+            ss.del_worksheet(sheetio.find_tab(ss, _old))
+            print(f"  [Sheet] removed superseded '{_old}' tab", flush=True)
+        except Exception:
+            pass
     print("\n  Done.\n", flush=True)
 
 
@@ -196,56 +305,96 @@ def _report(rows):
     print(f"  {'-' * 70}", flush=True)
 
 
-def _write(ss, title, rows, now):
+class _Batch:
+    """Collects every tab's values and every formatting request, then delivers
+    the whole run's writes in TWO API calls: one values_batchUpdate, one
+    spreadsheet batch_update. Fourteen write calls become two — faster, and
+    almost no write-quota pressure against the hourly cloud jobs."""
+
+    def __init__(self, ss):
+        self.ss = ss
+        self.values = []
+        self.reqs = []
+
+    def add_values(self, title, matrix):
+        self.values.append({"range": f"'{title}'!A1", "values": matrix})
+
+    def fmt(self, sid, r0, r1, c0, c1, cellfmt, fields):
+        self.reqs.append({"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r1,
+                      "startColumnIndex": c0, "endColumnIndex": c1},
+            "cell": {"userEnteredFormat": cellfmt} if cellfmt else {},
+            "fields": fields}})
+
+    def freeze(self, sid):
+        self.reqs.append({"updateSheetProperties": {
+            "properties": {"sheetId": sid,
+                           "gridProperties": {"frozenRowCount": 1}},
+            "fields": "gridProperties.frozenRowCount"}})
+
+    def flush(self):
+        from tracking_suite.sheetio import _with_quota_retry
+        if self.values:
+            _with_quota_retry(lambda: self.ss.values_batch_update(
+                {"valueInputOption": "USER_ENTERED", "data": self.values}),
+                "batched values write")
+        if self.reqs:
+            _with_quota_retry(
+                lambda: self.ss.batch_update({"requests": self.reqs}),
+                "batched formatting")
+        print(f"  [Sheet] delivered {len(self.values)} tab(s) in 1 values "
+              f"call + {len(self.reqs)} format op(s) in 1 batch", flush=True)
+        self.values, self.reqs = [], []
+
+
+_DUR_FMT = {"numberFormat": {"type": "TIME", "pattern": "[h]:mm:ss"}}
+_F_DUR = "userEnteredFormat.numberFormat"
+_F_HDR = "userEnteredFormat(backgroundColor,textFormat)"
+
+
+def _hdr_fmt():
+    from tracking_suite.sheetio import HEADER_BG, HEADER_FG
+    return {"backgroundColor": HEADER_BG,
+            "textFormat": {"bold": True, "foregroundColor": HEADER_FG}}
+
+
+def _write(ss, title, rows, now, batch):
     ws = sheetio.get_or_create(ss, title, len(tracker.HEADERS), len(rows) + 20)
     matrix = [tracker.HEADERS] + [[r.get(h, "") for h in tracker.HEADERS]
                                   for r in rows]
     # pad blank rows so a shrinking list never leaves stale rows behind
     # (we deliberately do NOT clear(), so user formatting/colours stay)
     matrix += [[""] * len(tracker.HEADERS) for _ in range(80)]
-    from tracking_suite.sheetio import _with_quota_retry
-    _with_quota_retry(lambda: ws.update(values=matrix, range_name="A1",
-                                        value_input_option="USER_ENTERED"),
-                      f"write '{title}'")
-    print(f"  [Sheet] '{title}': {len(rows)} row(s)", flush=True)
+    batch.add_values(title, matrix)
+    print(f"  [Sheet] '{title}': {len(rows)} row(s) queued", flush=True)
 
-    # header + dropdown validations
-    try:
-        from tracking_suite.sheetio import HEADER_BG, HEADER_FG
-        # TAT and Late Hrs are DURATIONS — force [h]:mm:ss so "9:12" can never
-        # be mistaken for 9:12 AM by the sheet.
-        dur = {"numberFormat": {"type": "TIME", "pattern": "[h]:mm:ss"}}
-        gcol = sheetio.col_a1(tracker.HEADERS.index("TAT"))
-        ncol = sheetio.col_a1(tracker.HEADERS.index("Late Hrs"))
-        last = len(rows) + 80
-        ws.format(f"{gcol}2:{gcol}{last}", dur)
-        ws.format(f"{ncol}2:{ncol}{last}", dur)
-        ws.format("A1:P1", {"backgroundColor": HEADER_BG,
-                            "textFormat": {"bold": True,
-                                           "foregroundColor": HEADER_FG}})
-        ws.freeze(rows=1)
-        sid = ws.id
-        def dv(col_idx, values):
-            return {"setDataValidation": {
-                "range": {"sheetId": sid, "startRowIndex": 1,
-                          "endRowIndex": len(rows) + 60,
-                          "startColumnIndex": col_idx,
-                          "endColumnIndex": col_idx + 1},
-                "rule": {"condition": {"type": "ONE_OF_LIST",
-                                       "values": [{"userEnteredValue": v}
-                                                  for v in values]},
-                         "showCustomUi": True, "strict": False}}}
-        ss.batch_update({"requests": [
-            dv(tracker.HEADERS.index("Status"), tracker.STATUS_VALUES),
-            dv(tracker.HEADERS.index("Performance"),
-               [tracker.P_ONTIME, tracker.P_DELAY]),
-            dv(tracker.HEADERS.index("ARRIVAL STATUS"), tracker.ARRIVAL_VALUES),
-        ]})
-        print("  [Sheet] dropdowns set for Status / Performance / Arrival",
-              flush=True)
-        _paint(ss, ws, rows, title)
-    except Exception as exc:
-        print(f"  [WARN] formatting/validation: {str(exc)[:80]}", flush=True)
+    sid = ws.id
+    last = len(rows) + 80
+    # TAT and Late Hrs are DURATIONS — force [h]:mm:ss so "9:12" can never
+    # be mistaken for 9:12 AM by the sheet.
+    for col in ("TAT", "Late Hrs"):
+        c = tracker.HEADERS.index(col)
+        batch.fmt(sid, 1, last, c, c + 1, _DUR_FMT, _F_DUR)
+    batch.fmt(sid, 0, 1, 0, len(tracker.HEADERS), _hdr_fmt(), _F_HDR)
+    batch.freeze(sid)
+
+    def dv(col_idx, values):
+        return {"setDataValidation": {
+            "range": {"sheetId": sid, "startRowIndex": 1,
+                      "endRowIndex": len(rows) + 60,
+                      "startColumnIndex": col_idx,
+                      "endColumnIndex": col_idx + 1},
+            "rule": {"condition": {"type": "ONE_OF_LIST",
+                                   "values": [{"userEnteredValue": v}
+                                              for v in values]},
+                     "showCustomUi": True, "strict": False}}}
+    batch.reqs += [
+        dv(tracker.HEADERS.index("Status"), tracker.STATUS_VALUES),
+        dv(tracker.HEADERS.index("Performance"),
+           [tracker.P_ONTIME, tracker.P_DELAY]),
+        dv(tracker.HEADERS.index("ARRIVAL STATUS"), tracker.ARRIVAL_VALUES),
+    ]
+    _paint(ws, rows, title, batch)
 
 
 # ── the colour language (agreed on the Ghost Trips page) ─────────────────────
@@ -284,12 +433,12 @@ def _delay_shade(late_hours):
     return RED3_BG, RED3_FG
 
 
-def _paint(ss, ws, rows, title):
-    """Every semantic colour in ONE batch_update — no extra reads, quota-safe."""
+def _paint(ws, rows, title, batch):
+    """Every semantic colour, appended to the run-wide write batch."""
     sid = ws.id
     n_cols = len(tracker.HEADERS)
     last = len(rows) + 80
-    reqs = []
+    reqs = batch.reqs
 
     def cell(r0, c0, bg, fg, r1=None, c1=None):
         f = {"backgroundColor": bg}
@@ -345,6 +494,11 @@ def _paint(ss, ws, rows, title):
             cell(rr, H("Performance"), bg, fg)
             if (r.get("Late Hrs") or "").strip():
                 cell(rr, H("Late Hrs"), bg, fg)
+        # a via waiting for its map pin: RED on the Via Point cell —
+        # red = blocked on a human action, not an estimate
+        if any(v.result in ("unknown hub", "pending hub")
+               for v in (r.get("_vias") or [])):
+            cell(rr, H("Via Point"), RED1_BG, RED1_FG)
         # predicted rows: the whole planned part goes italic
         if r.get("_trust") == "pred":
             reqs.append({"repeatCell": {
@@ -353,11 +507,7 @@ def _paint(ss, ws, rows, title):
                           "endColumnIndex": H("Actual Arrival Date&Time") + 1},
                 "cell": {"userEnteredFormat": {"textFormat": {"italic": True}}},
                 "fields": "userEnteredFormat.textFormat.italic"}})
-    from tracking_suite.sheetio import _with_quota_retry
-    _with_quota_retry(lambda: ss.batch_update({"requests": reqs}),
-                      f"paint '{title}'")
-    print(f"  [Sheet] '{title}': colours painted ({len(reqs)} format op(s))",
-          flush=True)
+    print(f"  [Sheet] '{title}': colours queued", flush=True)
 
 
 # ── Extra Trips — permanent record of trips the website never filed ──────────
@@ -366,7 +516,7 @@ XHEADERS = ["Detected On", "Vehicle No", "From", "To", "Via", "DEP (hub exit)",
 _OPEN = {"", "FORMING", "PREDICTED"}
 
 
-def _extra_write(ss, title, ghosts, reals, now):
+def _extra_write(ss, title, ghosts, reals, now, batch, cur=None):
     """Append-and-update: one row per detected ghost trip, never deleted.
     Open rows are reconciled with the real Trip ID once the site files it."""
     from tracking_suite.sheetio import _with_quota_retry
@@ -377,10 +527,11 @@ def _extra_write(ss, title, ghosts, reals, now):
         except (ValueError, TypeError):
             return None
 
-    try:
-        cur = sheetio.read_records(ss, title)
-    except RuntimeError:
-        cur = []
+    if cur is None:
+        try:
+            cur = sheetio.read_records(ss, title)
+        except RuntimeError:
+            cur = []
     rows = [dict(r) for r in cur if (r.get("Vehicle No") or "").strip()]
 
     # 1 · reconcile: the site finally filed a trip for an open prediction.
@@ -437,18 +588,10 @@ def _extra_write(ss, title, ghosts, reals, now):
     ws = sheetio.get_or_create(ss, title, len(XHEADERS), len(rows) + 40)
     matrix = [XHEADERS] + [[r.get(h, "") for h in XHEADERS] for r in rows]
     matrix += [[""] * len(XHEADERS) for _ in range(20)]
-    _with_quota_retry(lambda: ws.update(values=matrix, range_name="A1",
-                                        value_input_option="USER_ENTERED"),
-                      f"write '{title}'")
-    try:
-        from tracking_suite.sheetio import HEADER_BG, HEADER_FG
-        ws.format("A1:J1", {"backgroundColor": HEADER_BG,
-                            "textFormat": {"bold": True,
-                                           "foregroundColor": HEADER_FG}})
-        ws.freeze(rows=1)
-    except Exception:
-        pass
-    print(f"  [Sheet] '{title}': {len(rows)} ghost trip(s) on record",
+    batch.add_values(title, matrix)
+    batch.fmt(ws.id, 0, 1, 0, len(XHEADERS), _hdr_fmt(), _F_HDR)
+    batch.freeze(ws.id)
+    print(f"  [Sheet] '{title}': {len(rows)} ghost trip(s) queued",
           flush=True)
 
 
@@ -467,7 +610,8 @@ def _dur(hours) -> str:
     return f"{m // 60:02d}:{m % 60:02d}:00"
 
 
-def _completed_write(ss, types, hubs, index, sheet_tats, rows, now):
+def _completed_write(ss, types, hubs, index, sheet_tats, rows, now,
+                     batch, cur=None):
     """One row per trip THE TRACKER ITSELF verified as completed (arrival
     proven by GPS + the 2h unloading window elapsed) — in the trip-sheet
     format. NOT a history dump: a trip enters this tab only when the live
@@ -488,10 +632,11 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now):
         except (ValueError, TypeError):
             return None
 
-    try:
-        cur = sheetio.read_records(ss, TAB_COMPLETED)
-    except RuntimeError:
-        cur = []
+    if cur is None:
+        try:
+            cur = sheetio.read_records(ss, TAB_COMPLETED)
+        except RuntimeError:
+            cur = []
     byid: dict = {}
     for r in cur:
         v = (r.get("Vehicle_Number") or "").strip().upper()
@@ -516,12 +661,17 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now):
                         cand = (d, k)
         return cand[1] if cand else None
 
-    def make_rec(rps, vno, o, vias, d, start, end, status, late_reason=""):
+    def make_rec(rps, vno, o, vias, d, start, end, status, late_reason="",
+                 touch_h=0.0):
         tat_h, _ = tracker.lane_tat({}, atlas, o, d, sheet=sheet_tats)
         transit_h = (end - start).total_seconds() / 3600 \
             if (start and end) else None
-        delay = (max(0.0, transit_h - tat_h)
-                 if (transit_h is not None and tat_h) else None)
+        # the user's model: actual transit = total elapsed minus the time
+        # spent touching via hubs; delay is judged on the actual transit
+        actual_h = (max(0.0, transit_h - touch_h)
+                    if transit_h is not None else None)
+        delay = (max(0.0, actual_h - tat_h)
+                 if (actual_h is not None and tat_h) else None)
         return {
             "RPS_Number": rps or "PREDICTED",
             "Vehicle_Number": vno,
@@ -532,8 +682,8 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now):
             "Start_Time": start.strftime(tracker._DT_OUT) if start else "",
             "End_Time": end.strftime(tracker._DT_OUT) if end else "",
             "Transit_Time": _dur(transit_h),
-            "Extra_Touching_Time": "",
-            "Actual_Transit_Time": _dur(transit_h),
+            "Extra_Touching_Time": _dur(touch_h) if touch_h else "",
+            "Actual_Transit_Time": _dur(actual_h),
             "Delay_Hours": _dur(delay) if delay else "",
             "Late Reason": late_reason,
             "Status": status,
@@ -563,8 +713,10 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now):
         if not (tid and start and end and end > start):
             continue
         o, d = r.get("From", ""), r.get("To", "")
-        vias = [v.strip() for v in str(r.get("Via Point", "")).split(",")
-                if v.strip()]
+        vias = tracker.via_codes(str(r.get("Via Point", "")))
+        # measured via dwell time for this trip (the touching engine)
+        touch_h = sum((v.dwell_h or 0.0) for v in (r.get("_vias") or [])
+                      if v.result in ("stopped", "stopped (in GPS gap)"))
         # the trip's journal (human notes + dated machine events, minus the
         # volatile "now" line) becomes the Late Reason — the why behind Delay
         journal = "; ".join(
@@ -576,14 +728,14 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now):
             k = find_pred(vno, start) or ("pred", vno,
                                           start.strftime(tracker._DT_OUT))
             upsert(k, make_rec("", vno, o, vias, d, start, end,
-                               "COMPLETED (PREDICTED)", journal))
+                               "COMPLETED (PREDICTED)", journal, touch_h))
         else:
             pk = find_pred(vno, start)
             if pk:
                 del byid[pk]        # the site filed our prediction: one row
             upsert(("rps", tid.lstrip("0")),
                    make_rec(tid, vno, o, vias, d, start, end, "COMPLETED",
-                            journal))
+                            journal, touch_h))
 
     out = list(byid.values())
     out.sort(key=lambda r: parse_dt(r.get("End_Time")) or datetime.min,
@@ -591,25 +743,258 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now):
     ws = sheetio.get_or_create(ss, TAB_COMPLETED, len(CHEADERS), len(out) + 40)
     matrix = [CHEADERS] + [[r.get(h, "") for h in CHEADERS] for r in out]
     matrix += [[""] * len(CHEADERS) for _ in range(20)]
-    _with_quota_retry(lambda: ws.update(values=matrix, range_name="A1",
-                                        value_input_option="USER_ENTERED"),
-                      f"write '{TAB_COMPLETED}'")
-    try:
-        from tracking_suite.sheetio import HEADER_BG, HEADER_FG
-        dur = {"numberFormat": {"type": "TIME", "pattern": "[h]:mm:ss"}}
-        last = len(out) + 20
-        for col in ("Route_TAT", "Transit_Time", "Extra_Touching_Time",
-                    "Actual_Transit_Time", "Delay_Hours"):
-            a = sheetio.col_a1(CHEADERS.index(col))
-            ws.format(f"{a}2:{a}{last}", dur)
-        ws.format("A1:N1", {"backgroundColor": HEADER_BG,
-                            "textFormat": {"bold": True,
-                                           "foregroundColor": HEADER_FG}})
-        ws.freeze(rows=1)
-    except Exception:
-        pass
-    print(f"  [Sheet] '{TAB_COMPLETED}': {len(out)} tracker-completed trip(s)",
-          flush=True)
+    batch.add_values(TAB_COMPLETED, matrix)
+    last = len(out) + 20
+    for col in ("Route_TAT", "Transit_Time", "Extra_Touching_Time",
+                "Actual_Transit_Time", "Delay_Hours"):
+        c = CHEADERS.index(col)
+        batch.fmt(ws.id, 1, last, c, c + 1, _DUR_FMT, _F_DUR)
+    batch.fmt(ws.id, 0, 1, 0, len(CHEADERS), _hdr_fmt(), _F_HDR)
+    batch.freeze(ws.id)
+    print(f"  [Sheet] '{TAB_COMPLETED}': {len(out)} tracker-completed trip(s) "
+          f"queued", flush=True)
+
+
+# ── Pending hubs — an unknown via becomes a Hub List row the human finishes ──
+# The contract (user design): unknown via -> RED + a placeholder Hub List row
+# with Latitude/Longitude "-"; the human pastes the pin from Google Maps; the
+# next run completes Radius/Verify/Gap/Confidence/Spread from the fleet's own
+# FMS sightings and the hub goes live for via timing.
+import re as _re
+_NAMECODE_RE = _re.compile(r'([A-Z][A-Z0-9 .&-]{2,40}?)\s*\(([A-Z0-9]{3,8})\)')
+_PENDING_MARK = "PENDING — add Latitude/Longitude from Google Maps"
+
+
+def _request_pending_hubs(ss, hubs, rows, trips_by, now):
+    """Append one placeholder Hub List row per never-seen via identifier."""
+    from tracking_suite.sheetio import _with_quota_retry
+    unknowns = []
+    for r in rows:
+        for v in (r.get("_vias") or []):
+            if v.result == "unknown hub" and v.via not in unknowns:
+                unknowns.append(v.via)
+    if not unknowns:
+        return
+    known = {tracker._norm(c) for c in hubs["by_code"]}
+    known |= {tracker._norm(n) for n in hubs["names"].values()}
+    known |= {tracker._norm(p) for p in hubs.get("pending", set())}
+    # route strings often carry the FMS code for the name: "BHAGWANPUR(BGW01)"
+    code_by_name = {}
+    for trips in trips_by.values():
+        for t in trips:
+            for nm, code in _NAMECODE_RE.findall(
+                    (t.get("route") or "").upper()):
+                code_by_name.setdefault(tracker._norm(nm), code)
+    ws = sheetio.find_tab(ss, config.TAB_HUB_LIST)
+    hdr = _with_quota_retry(lambda: ws.row_values(1), "Hub List header")
+    new = []
+    for ident in unknowns:
+        idn = tracker._norm(ident)
+        if not idn or idn in known:
+            continue
+        known.add(idn)
+        code = ident if _re.fullmatch(r'[A-Z]{2,4}\d{2,3}', ident.upper()) \
+            else code_by_name.get(idn, idn.replace(" ", "")[:12])
+        vals = {"Hub_Code": code.upper(), "Hub_Name": ident.title(),
+                "Latitude": "-", "Longitude": "-",
+                "Verify_Status": _PENDING_MARK,
+                "Last_Updated": now.strftime(tracker._DT_OUT)}
+        new.append([vals.get(h, "") for h in hdr])
+    if new:
+        _with_quota_retry(lambda: ws.append_rows(
+            new, value_input_option="USER_ENTERED"), "append pending hubs")
+        print(f"  [Hub List] {len(new)} pending hub row(s) added — waiting "
+              f"for coordinates: "
+              + ", ".join(r[0] for r in new), flush=True)
+
+
+def _complete_pending_hubs(ss, live_by, trips_by, now) -> int:
+    """A PENDING row where the human has now written numeric coordinates gets
+    finished the tracker way: sightings of that name in the fleet's own FMS
+    location texts -> Gap/Spread/Radius/Confidence + a verdict on the pin."""
+    from statistics import median
+    from tracking_suite.presence import haversine_m
+    from tracking_suite.sheetio import _with_quota_retry
+    ws = sheetio.find_tab(ss, config.TAB_HUB_LIST)
+    grid = _with_quota_retry(ws.get_all_values, "Hub List for completion")
+    if not grid:
+        return 0
+    hdr = grid[0]
+
+    def col(name):
+        return hdr.index(name) if name in hdr else None
+
+    ic, inm = col("Hub_Code"), col("Hub_Name")
+    ila, ilo = col("Latitude"), col("Longitude")
+    ist = col("Verify_Status")
+    if None in (ic, ila, ilo, ist):
+        return 0
+    done = 0
+    for rix, row in enumerate(grid[1:], start=2):
+        st = row[ist] if ist < len(row) else ""
+        if "PENDING" not in st.upper():
+            continue
+        try:
+            plat = float(row[ila])
+            plon = float(row[ilo])
+        except (TypeError, ValueError, IndexError):
+            continue                      # still waiting for the human
+        code = (row[ic] or "").strip().upper()
+        name = (row[inm] or "").strip() if inm is not None else ""
+        idn = tracker._norm(name) or tracker._norm(code)
+        # vehicles whose trips touch this hub are the witnesses
+        cands = []
+        for vno, trips in trips_by.items():
+            if vno in live_by and any(
+                    tracker._norm(s) == idn or s.upper() == code
+                    for t in trips for s in (t.get("segs") or [])):
+                cands.append(vno)
+        sight = []
+        for vno in cands[:5]:
+            try:
+                vid = int(live_by[vno].get("vehicleId"))
+            except (TypeError, ValueError):
+                continue
+            for p in fms.tracking_report(vid, now - timedelta(days=3), now):
+                loc = str(p.get("location") or p.get("Location") or "")
+                if idn and idn in tracker._norm(loc) \
+                        or (code and code in loc.upper()):
+                    try:
+                        la = float(p.get("latitude") or 0)
+                        lo = float(p.get("longitude") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if la and lo:
+                        sight.append((la, lo))
+            if len(sight) >= 200:
+                break
+        upd = dict(zip(hdr, row + [""] * (len(hdr) - len(row))))
+        if len(sight) >= 5:
+            cla = median(s[0] for s in sight)
+            clo = median(s[1] for s in sight)
+            gap = haversine_m(cla, clo, plat, plon)
+            dists = sorted(haversine_m(cla, clo, s[0], s[1]) for s in sight)
+            spread = dists[int(0.85 * (len(dists) - 1))]
+            upd["Radius_M"] = str(int(min(max(spread * 2, 800), 2000)))
+            upd["Gap_M"] = str(int(gap))
+            upd["Spread_M"] = str(int(spread))
+            upd["Verify_Status"] = ("CONFIRMED" if gap <= 400 else
+                                    "CLOSE" if gap <= 800 else "INVESTIGATE")
+            upd["Confidence"] = ("HIGH" if len(sight) >= 20 else
+                                 "MED" if len(sight) >= 8 else "LOW")
+        else:
+            upd["Radius_M"] = "1500"
+            upd["Verify_Status"] = "UNVERIFIED (no FMS sightings yet)"
+            upd["Confidence"] = "LOW"
+        if "Last_Updated" in hdr:
+            upd["Last_Updated"] = now.strftime(tracker._DT_OUT)
+        _with_quota_retry(lambda rix=rix, u=upd: ws.update(
+            values=[[u.get(h, "") for h in hdr]],
+            range_name=f"A{rix}", value_input_option="USER_ENTERED"),
+            f"complete hub '{code}'")
+        print(f"  [Hub List] '{code}' completed from {len(sight)} FMS "
+              f"sighting(s) — {upd['Verify_Status']}", flush=True)
+        done += 1
+    return done
+
+
+# ── Via Touching — one row per via visit, the third report of the trio ───────
+VIA_TAB = "Via Touching"
+VIA_HEADERS = ["Trip ID", "Vehicle No", "From", "To", "DEP Date&Time",
+               "Via Hub", "Entry Time", "Exit Time", "Touching Hours",
+               "Confidence", "Result", "Updated"]
+_CONF_RANK = {"": 0, "INFERRED": 1, "INTERPOLATED": 2, "CONFIRMED": 3}
+_FINAL_RESULTS = {"stopped", "passed through", "stopped (in GPS gap)"}
+
+
+def _via_write(ss, title, rows, now, batch, cur=None):
+    """Upsert one row per (trip, via). A finalised row (exit known) is only
+    replaced by evidence of equal or better confidence — so a via recorded
+    CONFIRMED yesterday can never be downgraded by today's truncated trail."""
+    from tracking_suite.sheetio import _with_quota_retry
+    if cur is None:
+        try:
+            cur = sheetio.read_records(ss, title)
+        except RuntimeError:
+            cur = []
+
+    def key(r):
+        veh = (r.get("Vehicle No") or "").strip().upper()
+        tid = str(r.get("Trip ID") or "").strip().lstrip("0")
+        if not tid or tid.upper() == "PREDICTED":
+            tid = "P|" + (r.get("DEP Date&Time") or "").strip()
+        return (veh, tid, (r.get("Via Hub") or "").strip())
+
+    byk, order = {}, []
+    for r in cur:
+        if (r.get("Vehicle No") or "").strip() and (r.get("Via Hub") or "").strip():
+            k = key(r)
+            if k not in byk:
+                byk[k] = dict(r)
+                order.append(k)
+
+    n_new = 0
+    for r in rows:
+        visits = r.get("_vias") or []
+        if not visits:
+            continue
+        for v in visits:
+            rec = {
+                "Trip ID": r.get("Trip ID", ""),
+                "Vehicle No": r["Vehicle No"],
+                "From": r.get("From", ""),
+                "To": r.get("To", ""),
+                "DEP Date&Time": r.get("DEP Date&Time", ""),
+                "Via Hub": v.via,
+                "Entry Time": v.entry.strftime(tracker._DT_OUT)
+                              if v.entry else "",
+                "Exit Time": v.exit.strftime(tracker._DT_OUT)
+                             if v.exit else "",
+                "Touching Hours": _dur(v.dwell_h)
+                                  if v.dwell_h is not None else "",
+                "Confidence": v.confidence,
+                "Result": v.result,
+                "Updated": now.strftime(tracker._DT_OUT),
+            }
+            k = key(rec)
+            old = byk.get(k)
+            if old:
+                old_final = bool((old.get("Exit Time") or "").strip()) \
+                    and (old.get("Result") or "").strip() in _FINAL_RESULTS
+                new_final = v.result in _FINAL_RESULTS
+                if old_final and not new_final:
+                    continue            # never downgrade a finished verdict
+                if old_final and new_final \
+                        and _CONF_RANK.get(v.confidence, 0) \
+                        < _CONF_RANK.get((old.get("Confidence") or "").strip(), 0):
+                    continue
+                byk[k] = rec
+            else:
+                byk[k] = rec
+                order.append(k)
+                n_new += 1
+
+    out = [byk[k] for k in order]
+    ws = sheetio.get_or_create(ss, title, len(VIA_HEADERS), len(out) + 40)
+    matrix = [VIA_HEADERS] + [[r.get(h, "") for h in VIA_HEADERS]
+                              for r in out]
+    matrix += [[""] * len(VIA_HEADERS) for _ in range(20)]
+    batch.add_values(title, matrix)
+    sid = ws.id
+    c = VIA_HEADERS.index("Touching Hours")
+    batch.fmt(sid, 1, len(out) + 20, c, c + 1, _DUR_FMT, _F_DUR)
+    batch.fmt(sid, 0, 1, 0, len(VIA_HEADERS), _hdr_fmt(), _F_HDR)
+    batch.freeze(sid)
+    # RED rows = via hub waiting for its map pin (human action pending)
+    batch.fmt(sid, 1, len(out) + 20, 0, len(VIA_HEADERS), None,
+              "userEnteredFormat.backgroundColor")
+    for i, r in enumerate(out):
+        if (r.get("Result") or "").strip() in ("unknown hub", "pending hub"):
+            batch.fmt(sid, i + 1, i + 2, 0, len(VIA_HEADERS),
+                      {"backgroundColor": RED1_BG},
+                      "userEnteredFormat.backgroundColor")
+    print(f"  [Sheet] '{title}': {len(out)} via visit(s) queued "
+          f"({n_new} new)", flush=True)
 
 
 if __name__ == "__main__":

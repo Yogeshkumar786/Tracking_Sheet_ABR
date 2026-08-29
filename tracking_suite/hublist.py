@@ -62,18 +62,21 @@ def _cluster(by_code: dict) -> dict:
     return {c: find(c) for c in codes}
 
 
-def load(ss) -> dict:
+def load(ss, rows: list | None = None) -> dict:
     """Read the Hub List tab. Returns a dict of lookups the reports use:
 
         by_code    {CODE: (lat, lon)}
         names      {CODE: hub_name}
         radius     {CODE: radius_m}   per-hub, from the list
         rows       the raw records, for anything else
+
+    Pass `rows` (records already read via a batched call) to skip the read.
     """
-    try:
-        rows = sheetio.read_records(ss, config.TAB_HUB_LIST)
-    except RuntimeError:
-        rows = []
+    if rows is None:
+        try:
+            rows = sheetio.read_records(ss, config.TAB_HUB_LIST)
+        except RuntimeError:
+            rows = []
     if not rows:
         raise RuntimeError(
             f"The '{config.TAB_HUB_LIST}' tab is empty or missing.\n"
@@ -81,7 +84,7 @@ def load(ss) -> dict:
             f"  (it needs a completed hub discovery run behind it)."
         )
 
-    by_code, names, radius = {}, {}, {}
+    by_code, names, radius, vstatus, pending = {}, {}, {}, {}, set()
     for r in rows:
         code = (r.get("Hub_Code") or "").strip().upper()
         if not code:
@@ -90,9 +93,16 @@ def load(ss) -> dict:
             lat = float(r.get("Latitude"))
             lon = float(r.get("Longitude"))
         except (TypeError, ValueError):
+            # a placeholder row waiting for the human's Google-Maps pin —
+            # remember it so the via engine can say "pending" not "unknown"
+            pending.add(code)
+            nm = (r.get("Hub_Name") or "").strip().upper()
+            if nm:
+                pending.add(nm)
             continue
         by_code[code] = (lat, lon)
         names[code] = (r.get("Hub_Name") or "").strip()
+        vstatus[code] = (r.get("Verify_Status") or "").strip().upper()
         try:
             radius[code] = float(r.get("Radius_M"))
         except (TypeError, ValueError):
@@ -101,9 +111,12 @@ def load(ss) -> dict:
     cluster = _cluster(by_code)
     n_clusters = len(set(cluster.values()))
     print(f"  [Hub List] {len(by_code)} verified hub(s) loaded, "
-          f"{n_clusters} base region(s)", flush=True)
+          f"{n_clusters} base region(s)"
+          + (f", {len(pending)//2 or len(pending)} pending pin(s)"
+             if pending else ""), flush=True)
     return {"by_code": by_code, "names": names, "radius": radius,
-            "cluster": cluster, "rows": rows}
+            "cluster": cluster, "rows": rows, "vstatus": vstatus,
+            "pending": pending}
 
 
 def home_hub_code(home_hub_name: str, names: dict) -> str:

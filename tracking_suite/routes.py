@@ -26,7 +26,10 @@ has been idle since then.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
@@ -92,14 +95,11 @@ def _endpoints(route: str) -> tuple[str, str]:
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
 
-def fetch_trips(plates: list[str], days: int, now: datetime) -> dict:
-    """{plate: [trip, ...]} newest first. trip = {rps, route, origin, dest,
-    start_dt, end_dt}. Batched RPS calls (the report takes a list of plates)."""
-    from_time = (now - timedelta(days=days)).strftime("%Y-%m-%d 00:00:00")
-    to_time = now.strftime("%Y-%m-%d 23:59:59")
+def _fetch_window(plates: list, frm: datetime, to: datetime) -> dict:
+    """One batched sweep of the RPS report over [frm, to]."""
+    from_time = frm.strftime("%Y-%m-%d %H:%M:%S")
+    to_time = to.strftime("%Y-%m-%d %H:%M:%S")
     by_veh: dict = defaultdict(list)
-
-    plates = [p for p in plates if p]
     for i in range(0, len(plates), RPS_BATCH_SIZE):
         batch = plates[i:i + RPS_BATCH_SIZE]
         try:
@@ -126,12 +126,97 @@ def fetch_trips(plates: list[str], days: int, now: datetime) -> dict:
                 "start_dt": _parse_dt(_first(rec, F_START)),
                 "end_dt": _parse_dt(_first(rec, F_END)),
             })
+    return by_veh
+
+
+# Incremental history cache. Trips older than FRESH_DAYS are closed and
+# immutable on FMS, so they are cached on disk; every run re-fetches ONLY the
+# last FRESH_DAYS (which covers the longest trip we have ever seen, ~6 days,
+# with margin — anything that could still change is always fetched live).
+# A full sweep still happens once a day as a belt-and-braces guard, and any
+# cache problem silently degrades to the full sweep.
+_RPS_CACHE = os.path.join(os.path.dirname(__file__), ".cache", "rps.json")
+FRESH_DAYS = 7
+FULL_TTL_H = 24.0
+
+
+def _trip_dump(t):
+    return {**t,
+            "start_dt": t["start_dt"].isoformat() if t["start_dt"] else None,
+            "end_dt": t["end_dt"].isoformat() if t["end_dt"] else None}
+
+
+def _trip_load(t):
+    return {**t,
+            "start_dt": datetime.fromisoformat(t["start_dt"])
+            if t["start_dt"] else None,
+            "end_dt": datetime.fromisoformat(t["end_dt"])
+            if t["end_dt"] else None}
+
+
+def _trip_key(vno, t):
+    rid = (t.get("rps") or "").strip().lstrip("0")
+    return rid or f"{vno}|{t['start_dt']}"
+
+
+def fetch_trips(plates: list[str], days: int, now: datetime) -> dict:
+    """{plate: [trip, ...]} newest first. trip = {rps, route, origin, dest,
+    start_dt, end_dt, segs}. Incremental: cached immutable history + a live
+    re-fetch of the still-changeable recent window."""
+    plates = [p for p in plates if p]
+    win_start = now - timedelta(days=days)
+    fresh_start = now - timedelta(days=FRESH_DAYS)
+
+    cache = None
+    try:
+        raw = json.loads(open(_RPS_CACHE, encoding="utf-8").read())
+        if time.time() - raw["full_ts"] <= FULL_TTL_H * 3600 \
+                and raw.get("days", 0) >= days:
+            cache = {v: [_trip_load(t) for t in ts]
+                     for v, ts in raw["trips"].items()}
+    except Exception:
+        cache = None
+
+    if cache is None:
+        by_veh = _fetch_window(plates, win_start, now)
+        mode = f"full {days}d sweep"
+        full_ts = time.time()
+    else:
+        known = set(cache)
+        missing = [p for p in plates if p not in known]
+        inc = _fetch_window(plates, fresh_start, now)
+        old_for_new = _fetch_window(missing, win_start, fresh_start) \
+            if missing else {}
+        by_veh = defaultdict(list)
+        merged: dict = {}
+        for vno in set(list(cache) + list(inc) + list(old_for_new)):
+            keep = {}
+            for t in cache.get(vno, []):       # immutable part only
+                if t["start_dt"] and win_start <= t["start_dt"] < fresh_start:
+                    keep[_trip_key(vno, t)] = t
+            for t in old_for_new.get(vno, []):
+                if t["start_dt"] and t["start_dt"] < fresh_start:
+                    keep[_trip_key(vno, t)] = t
+            for t in inc.get(vno, []):         # fresh copy always wins
+                keep[_trip_key(vno, t)] = t
+            if keep:
+                by_veh[vno] = list(keep.values())
+        mode = f"cached + last {FRESH_DAYS}d live"
+        full_ts = raw["full_ts"]
 
     for vno, trips in by_veh.items():
         trips.sort(key=lambda t: t["start_dt"] or datetime.min, reverse=True)
+    try:
+        os.makedirs(os.path.dirname(_RPS_CACHE), exist_ok=True)
+        with open(_RPS_CACHE, "w", encoding="utf-8") as fh:
+            json.dump({"full_ts": full_ts, "days": days,
+                       "trips": {v: [_trip_dump(t) for t in ts]
+                                 for v, ts in by_veh.items()}}, fh)
+    except Exception:
+        pass
     print(f"  [RPS] {sum(len(v) for v in by_veh.values())} trip(s) for "
-          f"{len(by_veh)} vehicle(s) over {days} day(s)", flush=True)
-    return by_veh
+          f"{len(by_veh)} vehicle(s) over {days} day(s) ({mode})", flush=True)
+    return dict(by_veh)
 
 
 # ── Detect ───────────────────────────────────────────────────────────────────
