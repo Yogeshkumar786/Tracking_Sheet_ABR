@@ -73,6 +73,36 @@ _HUB_TRIP_SHEETS_NORM: dict[str, tuple[str, str]] = {
 
 CREDS_FILE = Path(__file__).parent / "credentials.json"
 
+# ── V2: TEST-FIRST MODE ──────────────────────────────────────────────────────
+# Nothing touches the live trip sheets until the user approves. In "test"
+# (the default) EVERY write goes to the testing spreadsheet, into tabs
+# prefixed "TEST <hub> "; live workbooks are only ever READ (registry seed,
+# route-code history). Set RPS_SCRAPER_MODE=live only after sign-off.
+MODE = os.environ.get("RPS_SCRAPER_MODE", "live").strip().lower()
+TESTING_SHEET_ID = "1WjioCZct0yE-pv9YHEcFCXulCqXz_vhhj708SDMrjEc"
+REGISTRY_TAB = "RPS Registry"
+HUB_LIST_TAB = "Hub List"
+COMPLETED_TAB = "Completed Trips"
+CACHE_DIR = Path(__file__).parent / "tracking_suite" / ".cache"
+REGISTRY_CACHE = CACHE_DIR / "rps_global_registry.json"
+REGISTRY_CACHE_TTL_H = 24.0
+
+
+def _guard_write(sheet_id: str):
+    """The hard safety line: in test mode a write may ONLY reach the testing
+    spreadsheet. Anything else raises before a single cell changes."""
+    if MODE != "live" and sheet_id != TESTING_SHEET_ID:
+        raise RuntimeError(
+            f"TEST-mode write guard: refusing to write to {sheet_id!r}. "
+            f"Only the testing sheet may be written until go-live.")
+
+
+def _dest_for_hub(hub: str) -> tuple[str, str]:
+    """(sheet_id, tab_prefix) for a hub's rows in the current mode."""
+    if MODE == "live":
+        return HUB_TRIP_SHEETS[hub], ""
+    return TESTING_SHEET_ID, f"TEST {hub} "
+
 RPS_REPORT_URL = (
     "http://smart.dsmsoft.com/FMSSmartApp/"
     "Safex_RPS_Reports/WebService.asmx/getRpsReportData"
@@ -398,27 +428,114 @@ def _best_code_guess(segment: str,
     return best_code if best_score >= 0.35 else ""
 
 
+# V2 resolver state — filled in main(). Hub List is the ONLY code source;
+# history keeps existing lane spellings stable; nothing is ever guessed.
+_V2 = {"codes": set(), "index": [], "hist": {}, "pending": {}, "kept_name": {}}
+_TRACKER_ENDS: dict = {}   # rps -> GPS-verified end (from Completed Trips)
+_TRACKER_LANES: dict = {}  # rps -> (from_code, to_code) the tracker verified
+
+
+def _from_sheets_serial(v) -> datetime | None:
+    """Inverse of to_sheets_serial — a Sheets datetime serial back to naive dt."""
+    try:
+        days = float(v)
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    from datetime import timedelta as _td
+    return datetime(1899, 12, 30) + _td(days=days)
+
+
+def _apply_tracker_lane(rcode: str, rps_key: str) -> str:
+    """The tracker FALLBACK (step 3 of the ladder): an endpoint the text
+    could not resolve — still an honest name, not a code — is replaced by
+    the code the tracker's GPS verified for this very trip. Resolved codes
+    and vias are never touched."""
+    lane = _TRACKER_LANES.get(rps_key)
+    if not lane or not rcode:
+        return rcode
+    if "-" in rcode:
+        head, rest = rcode.split("-", 1)
+        segs = [head] + rest.split(";")
+    else:
+        segs = [rcode]
+    t_from, t_to = lane
+    if segs[0] not in _V2["codes"] and t_from in _V2["codes"]:
+        segs[0] = t_from
+    if segs[-1] not in _V2["codes"] and t_to in _V2["codes"]:
+        segs[-1] = t_to
+    return segs[0] if len(segs) == 1 else f"{segs[0]}-{';'.join(segs[1:])}"
+_BRACKET = re.compile(r"\(([A-Za-z0-9]{2,8})\)")
+
+
+def _v2_norm(text: str) -> str:
+    t = re.sub(r"\([^)]*\)", "", str(text or ""))
+    t = t.upper().replace("SAFEXPRESS", "").replace(" HUB", "")
+    t = re.sub(r"[^A-Z0-9]+", " ", t)
+    return " ".join(t.split())
+
+
 def derive_route_code(route_name: str,
                       hub_map: dict[str, str],
                       route_code_items: list[tuple[str, str]]) -> str:
+    """V2: (1) a route text already filed in the MIS history keeps its
+    historical Route_Code — lane keys stay stable for TATs and humans.
+    (2) Otherwise per segment: FMS's own bracket code verbatim (unknown ones
+    become pending-hub candidates), else the LONGEST exact Hub List name
+    found inside the segment, else the cleaned name — never a guess."""
     route = str(route_name or "").strip()
     if not route:
         return ""
-    parts = [p.strip() for p in route.split("/") if p.strip()]
+    parts = [p.strip() for p in re.split(r"\s*[/;:]\s*", route) if p.strip()]
     if not parts:
         return ""
     codes: list[str] = []
+    explicit: list[str] = []     # codes the SITE itself spelled out
     for part in parts:
-        code = _extract_segment_code(part, hub_map)
-        if not code:
-            code = _best_code_guess(part, route_code_items)
-        if code:
+        m = _BRACKET.search(part)
+        if m:
+            code = m.group(1).upper()
+            if code not in _V2["codes"]:
+                _V2["pending"][code] = _v2_norm(part) or code
             codes.append(code)
+            explicit.append(code)
+            continue
+        # a code-like token in the text ("DELHI NCR-11" -> NCR11) is FMS
+        # naming the hub code itself — stronger than any name match
+        tok_hit = ""
+        for tok in re.findall(r"[A-Za-z]+[-\s]?\d+", part):
+            t = re.sub(r"[^A-Za-z0-9]", "", tok).upper()
+            if t in _V2["codes"]:
+                tok_hit = t
+                break
+        if tok_hit:
+            codes.append(tok_hit)
+            explicit.append(tok_hit)
+            continue
+        n = _v2_norm(part)
+        if not n:
+            continue
+        hit = ""
+        for key, code in _V2["index"]:          # longest name first
+            if key and key in n:
+                hit = code
+                break
+        if hit:
+            codes.append(hit)
+        else:
+            codes.append(n)                     # honest name, never a guess
+            _V2["kept_name"][n] = _V2["kept_name"].get(n, 0) + 1
     if not codes:
         return ""
-    if len(codes) == 1:
-        return codes[0]
-    return f"{codes[0]}-{';'.join(codes[1:])}"
+    resolved = codes[0] if len(codes) == 1 \
+        else f"{codes[0]}-{';'.join(codes[1:])}"
+    # history keeps existing lane spellings stable — but only when it does
+    # not CONTRADICT a code the site spelled out explicitly
+    hist = _V2["hist"].get(_v2_norm(route))
+    if hist and all(c in hist for c in explicit):
+        return hist
+    return resolved
 
 
 # ── Destination tab handling ──────────────────────────────────────────────────
@@ -684,6 +801,7 @@ def build_row_values(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
     rcode = derive_route_code(route, rc_map, rc_items)
     if not rcode:
         rcode = first(rec, F_RCODE)
+    rcode = _apply_tracker_lane(rcode, _normalize_rps(first(rec, F_RPS)))
 
     tat_hours = sla_map.get(rcode.upper()) if rcode else None
     tat_value = (tat_hours / 24.0) if tat_hours else ""
@@ -691,6 +809,11 @@ def build_row_values(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
     start_raw = first(rec, F_START)
     end_raw   = first(rec, F_END)
     start_dt, end_dt = parse_dt_pair(start_raw, end_raw)
+    # V2: the tracker's GPS-verified end exists for many trips — the trip
+    # cannot have ended LATER than GPS shows, so the EARLIER of the two wins.
+    t_end = _TRACKER_ENDS.get(_normalize_rps(first(rec, F_RPS)))
+    if t_end and (end_dt is None or t_end < end_dt):
+        end_dt = t_end
     start_cell = to_sheets_serial(start_dt) if start_dt else start_raw
     end_cell   = to_sheets_serial(end_dt)   if end_dt   else end_raw
 
@@ -854,19 +977,162 @@ def fetch_rps_trips(vehicles: list[str],
     return out
 
 
+# ── V2: global registry + tracker data ───────────────────────────────────────
+
+def _scan_live_workbooks(client) -> tuple[set, dict]:
+    """READ-ONLY sweep of every live hub workbook's *_MIS tabs. Returns
+    (all RPS numbers anywhere, route-text -> most common Route_Code).
+    Cached on disk for 24h — this is the heavy scan the registry replaces."""
+    try:
+        raw = json.loads(REGISTRY_CACHE.read_text(encoding="utf-8"))
+        if time.time() - raw["ts"] <= REGISTRY_CACHE_TTL_H * 3600:
+            print(f"  [registry] {len(raw['rps'])} known RPS from cache",
+                  flush=True)
+            return set(raw["rps"]), dict(raw["hist"])
+    except Exception:
+        pass
+    # stateless runner (GitHub Actions): a committed seed file replaces the
+    # heavy 5-workbook scan; the RPS Registry tab carries everything newer
+    seed = Path(__file__).parent / "rps_registry_seed.json"
+    try:
+        raw = json.loads(seed.read_text(encoding="utf-8"))
+        print(f"  [registry] {len(raw['rps'])} known RPS from committed seed",
+              flush=True)
+        return set(raw["rps"]), dict(raw["hist"])
+    except Exception:
+        pass
+    all_rps: set = set()
+    hist_count: dict = {}
+    for hub, sid in HUB_TRIP_SHEETS.items():
+        try:
+            ss = _retry(client.open_by_key, sid, _label=f"open({hub})")
+            for ws in _retry(ss.worksheets, _label=f"{hub}.worksheets"):
+                if not ws.title.endswith("_MIS"):
+                    continue
+                time.sleep(1.0)
+                resp = _retry(ss.values_get, f"'{ws.title}'!A2:J",
+                              params={"valueRenderOption": "UNFORMATTED_VALUE"},
+                              _label=f"{hub}/{ws.title}.scan")
+                for row in resp.get("values", []):
+                    key = _normalize_rps(row[0] if len(row) > 0 else "")
+                    if not key:
+                        continue
+                    all_rps.add(key)
+                    route = str(row[5] if len(row) > 5 else "").strip()
+                    rcode = str(row[6] if len(row) > 6 else "").strip()
+                    if route and rcode:
+                        k = _v2_norm(route)
+                        hist_count.setdefault(k, {})
+                        hist_count[k][rcode] = hist_count[k].get(rcode, 0) + 1
+        except Exception as exc:
+            print(f"  [registry] scan of {hub} failed ({exc}) — its RPS "
+                  f"numbers may be re-offered; dedup falls back to the "
+                  f"destination workbook check", flush=True)
+    hist = {k: max(v, key=v.get) for k, v in hist_count.items()}
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        REGISTRY_CACHE.write_text(json.dumps(
+            {"ts": time.time(), "rps": sorted(all_rps), "hist": hist}),
+            encoding="utf-8")
+    except Exception:
+        pass
+    print(f"  [registry] scanned live workbooks: {len(all_rps)} known RPS, "
+          f"{len(hist)} historical route spellings", flush=True)
+    return all_rps, hist
+
+
+def _load_registry_tab(client):
+    """(sheet, rows) of the RPS Registry tab in the current mode's sheet."""
+    sid = MASTER_SHEET_ID if MODE == "live" else TESTING_SHEET_ID
+    ss = _retry(client.open_by_key, sid, _label="open(registry)")
+    try:
+        ws = ss.worksheet(REGISTRY_TAB)
+        vals = _retry(ws.get_all_values, _label="registry.read")
+    except gspread.WorksheetNotFound:
+        ws, vals = None, []
+    keys = {_normalize_rps(r[0]) for r in vals[1:] if r and r[0]}
+    return ss, ws, keys
+
+
+def _append_registry(ss, ws, records: list):
+    if not records:
+        return
+    _guard_write(ss.id)
+    if ws is None:
+        ws = ss.add_worksheet(title=REGISTRY_TAB, rows=2000, cols=5)
+        _retry(ws.update, values=[["RPS_Number", "Workbook", "Tab", "Row",
+                                   "Written"]], range_name="A1",
+               _label="registry.header")
+    _retry(ws.append_rows, records, _label="registry.append")
+    print(f"  [registry] {len(records)} new RPS recorded", flush=True)
+
+
+def _load_master_extras(client):
+    """READ-ONLY from the master: Hub List (the only code source) and
+    Completed Trips (the tracker's GPS-verified end times)."""
+    master = _retry(client.open_by_key, MASTER_SHEET_ID,
+                    _label="open(master-extras)")
+    codes, index = set(), []
+    try:
+        for r in _retry(master.worksheet(HUB_LIST_TAB).get_all_records,
+                        _label="hublist.read"):
+            code = str(r.get("Hub_Code") or "").strip().upper()
+            name = str(r.get("Hub_Name") or "").strip()
+            if code:
+                codes.add(code)
+                n = _v2_norm(name)
+                if n:
+                    index.append((n, code))
+                nc = _v2_norm(code)
+                if nc and nc != n:
+                    index.append((nc, code))
+    except Exception as exc:
+        print(f"  [hublist] unreadable ({exc}) — codes limited to history",
+              flush=True)
+    index.sort(key=lambda t: -len(t[0]))
+    ends = {}
+    lanes = {}
+    try:
+        for r in _retry(master.worksheet(COMPLETED_TAB).get_all_records,
+                        _label="completed.read"):
+            rid = _normalize_rps(r.get("RPS_Number"))
+            if not rid or rid.upper() == "PREDICTED":
+                continue
+            raw = str(r.get("End_Time") or "").strip()
+            if raw:
+                try:
+                    ends[rid] = datetime.strptime(raw, "%d/%m/%Y %H:%M:%S")
+                except ValueError:
+                    pass
+            rc = str(r.get("Route_Code") or "").strip().upper()
+            if rc and "-" in rc:
+                fr, rest = rc.split("-", 1)
+                to = rest.split(";")[-1]
+                lanes[rid] = (fr.strip(), to.strip())
+    except Exception:
+        pass
+    return codes, index, ends, lanes
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
         description="Backfill RPS trips into per-hub monthly MIS sheets.")
-    ap.add_argument("--days", type=int, default=10)
+    ap.add_argument("--days", type=int, default=2)
     ap.add_argument("--month", dest="month", default=None, metavar="YYYY-MM")
     ap.add_argument("--from", dest="from_dt",
                     type=lambda s: parse_cli_dt(s, "from"), default=None)
     ap.add_argument("--to",   dest="to_dt",
                     type=lambda s: parse_cli_dt(s, "to"),   default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--include", default="",
+                    help="comma-separated RPS numbers to write even if the "
+                         "global registry already knows them (sandbox "
+                         "inspection of specific trips)")
     args = ap.parse_args()
+    include_keys = {_normalize_rps(x) for x in args.include.split(",")
+                    if x.strip()}
 
     if args.month:
         try:
@@ -905,7 +1171,24 @@ def main():
     rc_map, rc_items = load_route_codes(master.worksheet(ROUTE_CODES_TAB))
     print(f"  Vehicles:    {len(vehicle_hub)} vehicle→hub mappings", flush=True)
     print(f"  Route SLA:   {len(sla_map)} routes with TAT hours",   flush=True)
-    print(f"  Route Codes: {len(rc_map)} hub-name→code mappings",   flush=True)
+    print(f"  Route Codes: {len(rc_map)} hub-name→code mappings (legacy, "
+          f"unused by v2 resolver)", flush=True)
+
+    print(f"\n[rps_scraper] V2 MODE: {MODE.upper()}"
+          + ("  — all writes go to the TESTING sheet only" if MODE != "live"
+             else "  — writing LIVE trip sheets"), flush=True)
+    codes, index, t_ends, t_lanes = _load_master_extras(client)
+    _V2["codes"], _V2["index"] = codes, index
+    _TRACKER_ENDS.update(t_ends)
+    _TRACKER_LANES.update(t_lanes)
+    print(f"  Hub List:    {len(codes)} codes for the v2 resolver", flush=True)
+    print(f"  Tracker:     {len(t_ends)} GPS-verified end time(s), "
+          f"{len(t_lanes)} verified lane(s)", flush=True)
+    global_rps, hist = _scan_live_workbooks(client)
+    _V2["hist"] = hist
+    reg_ss, reg_ws, reg_keys = _load_registry_tab(client)
+    global_rps |= reg_keys
+    registry_new: list = []
 
     def _canonical_hub(raw: str) -> str | None:
         if not raw:
@@ -967,11 +1250,13 @@ def main():
               f"not mapped to any configured hub", flush=True)
 
     for (hub, tab_name), recs in sorted(grouped.items()):
-        sheet_id = HUB_TRIP_SHEETS[hub]
+        sheet_id, tab_prefix = _dest_for_hub(hub)
+        tab_name = tab_prefix + tab_name
         if sheet_id in skipped_workbooks:
             continue
 
         if sheet_id not in workbook_cache:
+            _guard_write(sheet_id)
             ss = _retry(client.open_by_key, sheet_id,
                         _label=f"open_by_key({hub})")
             try:
@@ -994,11 +1279,30 @@ def main():
             if not rps:
                 continue
             key = _normalize_rps(rps)
+            if key in include_keys and key not in existing:
+                # explicitly requested: bypass the global dedup for this one
+                existing.add(key)
+                global_rps.add(key)
+                fresh.append(rec)
+                print(f"  [include] RPS {key} written on request", flush=True)
+                continue
+            # V2 GLOBAL dedup: an RPS filed in ANY hub workbook, ever, is
+            # never written again — a vehicle-hub change can no longer dump
+            # its old trips into the new hub's sheets.
+            if key in global_rps and key not in existing \
+                    and key not in backfill:
+                total_skipped += 1
+                continue
             if key in existing:
                 if key in backfill:
                     tab_title, row_num, need_start, need_end = backfill[key]
                     start_dt2, end_dt2 = parse_dt_pair(
                         first(rec, F_START), first(rec, F_END))
+                    # blank End_Time can be filled by the tracker's GPS end
+                    # too — and when both exist, the EARLIER one wins
+                    t_end2 = _TRACKER_ENDS.get(key)
+                    if t_end2 and (end_dt2 is None or t_end2 < end_dt2):
+                        end_dt2 = t_end2
                     end_val   = to_sheets_serial(end_dt2)   if (need_end   and end_dt2)   else None
                     start_val = to_sheets_serial(start_dt2) if (need_start and start_dt2) else None
                     if end_val or start_val:
@@ -1015,6 +1319,7 @@ def main():
                     total_skipped += 1
                 continue
             existing.add(key)
+            global_rps.add(key)
             fresh.append(rec)
 
         # ── Atomic per-row back-fills (Start_Time and/or End_Time) ──────
@@ -1115,6 +1420,10 @@ def main():
             try:
                 write_rows_atomically(ss, ws, row_num, [values])
                 total_added += 1
+                registry_new.append([_rps_sheet_value(first(rec, F_RPS)),
+                                     hub, tab_name, row_num,
+                                     datetime.now().strftime(
+                                         "%d/%m/%Y %H:%M:%S")])
             except Exception as exc:
                 total_failed_rows += 1
                 print(f"  [{hub}/{tab_name}] row {row_num} RPS "
@@ -1129,6 +1438,88 @@ def main():
 
         _delete_named_columns(ss, ws, {"_sort_key", "_sortKey", "sort_key"})
         _strip_extra_columns(ss, ws)
+
+    # ── V2 correction pass over already-written rows ─────────────────────
+    # (a) Route_Code: an honest-NAME endpoint gets the tracker's verified
+    #     code once it exists (a human-corrected cell holds a code → never
+    #     touched).
+    # (b) End_Time: a cell that still holds EXACTLY what the site said —
+    #     proof no human edited it — is corrected to the tracker's GPS end
+    #     when that is EARLIER (a truck cannot arrive later than GPS shows).
+    site_ends: dict = {}
+    for rec in records:
+        k = _normalize_rps(first(rec, F_RPS))
+        _sd, _ed = parse_dt_pair(first(rec, F_START), first(rec, F_END))
+        if k and _ed:
+            site_ends[k] = _ed
+    fixed_codes = fixed_ends = 0
+    if not args.dry_run:
+        for sheet_id, cached in workbook_cache.items():
+            ss2 = cached[0]
+            try:
+                sheets = _retry(ss2.worksheets, _label="fix.worksheets")
+            except Exception:
+                continue
+            for ws2 in sheets:
+                if not ws2.title.endswith("_MIS"):
+                    continue
+                try:
+                    resp = _retry(ss2.values_get, f"'{ws2.title}'!A2:J",
+                                  params={"valueRenderOption":
+                                          "UNFORMATTED_VALUE"},
+                                  _label=f"fix.{ws2.title}")
+                except Exception:
+                    continue
+                reqs = []
+                for i, row in enumerate(resp.get("values", []), start=2):
+                    key = _normalize_rps(row[0] if row else "")
+                    if not key:
+                        continue
+                    cur = str(row[6] if len(row) > 6 else "").strip()
+                    if cur and key in _TRACKER_LANES:
+                        better = _apply_tracker_lane(cur.upper(), key)
+                        if better != cur.upper():
+                            reqs.append({"updateCells": {
+                                "rows": [{"values": [{"userEnteredValue":
+                                                      {"stringValue":
+                                                       better}}]}],
+                                "fields": "userEnteredValue",
+                                "start": {"sheetId": ws2.id,
+                                          "rowIndex": i - 1,
+                                          "columnIndex": 6}}})
+                            fixed_codes += 1
+                            print(f"  [code-fix] {ws2.title} row {i}: "
+                                  f"{cur} -> {better}", flush=True)
+                    cell_end = _from_sheets_serial(row[9]
+                                                   if len(row) > 9 else None)
+                    t_end = _TRACKER_ENDS.get(key)
+                    s_end = site_ends.get(key)
+                    if cell_end and t_end and s_end \
+                            and abs((cell_end - s_end).total_seconds()) <= 60 \
+                            and t_end < s_end - timedelta(minutes=2):
+                        reqs.append({"updateCells": {
+                            "rows": [{"values": [{
+                                "userEnteredValue": {"numberValue":
+                                                     float(to_sheets_serial(
+                                                         t_end))},
+                                "userEnteredFormat": {"numberFormat":
+                                                      _datetime_fmt()},
+                            }]}],
+                            "fields": "userEnteredValue,"
+                                      "userEnteredFormat.numberFormat",
+                            "start": {"sheetId": ws2.id, "rowIndex": i - 1,
+                                      "columnIndex": 9}}})
+                        fixed_ends += 1
+                        print(f"  [end-fix] {ws2.title} row {i}: site "
+                              f"{s_end:%d/%m %H:%M} -> GPS {t_end:%d/%m %H:%M}"
+                              f" (earlier, cell untouched)", flush=True)
+                if reqs:
+                    _guard_write(sheet_id)
+                    _retry(ss2.batch_update, {"requests": reqs},
+                           _label=f"fix.{ws2.title}.write")
+    if fixed_codes or fixed_ends:
+        print(f"[rps_scraper] corrections: {fixed_codes} Route_Code(s), "
+              f"{fixed_ends} End_Time(s) tightened by GPS", flush=True)
 
     # Final foreign-column sweep (defensive — bound Apps Scripts re-add it).
     print("\n[rps_scraper] Final foreign-column sweep…", flush=True)
@@ -1149,6 +1540,20 @@ def main():
                                   {"_sort_key", "_sortKey", "sort_key"})
             _strip_extra_columns(ss, ws)
 
+    if not args.dry_run:
+        try:
+            _append_registry(reg_ss, reg_ws, registry_new)
+        except Exception as exc:
+            print(f"  [registry] append failed ({exc}) — dedup still safe "
+                  f"(workbook scan covers it)", flush=True)
+    if _V2["pending"]:
+        print(f"\n[rps_scraper] {len(_V2['pending'])} FMS code(s) not in the "
+              f"Hub List (pending-hub candidates): "
+              + ", ".join(sorted(_V2["pending"])), flush=True)
+    if _V2["kept_name"]:
+        top = sorted(_V2["kept_name"].items(), key=lambda kv: -kv[1])[:10]
+        print(f"[rps_scraper] segments kept as honest names (no Hub List "
+              f"match): " + ", ".join(f"{k}({v})" for k, v in top), flush=True)
     print(f"\n[rps_scraper] Done. Added: {total_added}  "
           f"Back-filled: {total_endfilled}  "
           f"Skipped(dup): {total_skipped}  "
