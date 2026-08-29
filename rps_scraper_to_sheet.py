@@ -1183,7 +1183,12 @@ def main():
     master = client.open_by_key(MASTER_SHEET_ID)
     vehicle_hub, vt_map = load_vehicles_tab(master.worksheet(VEHICLES_TAB))
     sla_map = load_route_sla(master.worksheet(ROUTE_SLA_TAB))
-    rc_map, rc_items = load_route_codes(master.worksheet(ROUTE_CODES_TAB))
+    # Route Codes tab retired (2026-08-29): the v2 resolver uses the Hub List
+    # only — read the legacy tab if it still exists, else carry on without it
+    try:
+        rc_map, rc_items = load_route_codes(master.worksheet(ROUTE_CODES_TAB))
+    except gspread.WorksheetNotFound:
+        rc_map, rc_items = {}, []
     print(f"  Vehicles:    {len(vehicle_hub)} vehicle→hub mappings", flush=True)
     print(f"  Route SLA:   {len(sla_map)} routes with TAT hours",   flush=True)
     print(f"  Route Codes: {len(rc_map)} hub-name→code mappings (legacy, "
