@@ -443,6 +443,7 @@ def _best_code_guess(segment: str,
 _V2 = {"codes": set(), "index": [], "hist": {}, "pending": {}, "kept_name": {}}
 _TRACKER_ENDS: dict = {}   # rps -> GPS-verified end (from Completed Trips)
 _TRACKER_LANES: dict = {}  # rps -> (from_code, to_code) the tracker verified
+_TRACKER_TOUCH: dict = {}  # rps -> via touching hours the tracker measured
 
 
 def _from_sheets_serial(v) -> datetime | None:
@@ -1101,17 +1102,23 @@ def _load_master_extras(client):
               flush=True)
     index.sort(key=lambda t: -len(t[0]))
     # the tracker's Completed Trips ledgers live PER HUB WORKBOOK now
-    # (hub-only architecture) — union all five
+    # (hub-only architecture) — union all five. Also collected: each trip's
+    # Extra_Touching hours, and the ROW LOCATION of every queue entry so a
+    # fully-merged trip can be CONSUMED (deleted) from the queue.
     ends = {}
     lanes = {}
+    touch = {}
+    queue_rows: dict = {h: [] for h in HUB_TRACKING_SHEETS}
     for hub, sid in HUB_TRACKING_SHEETS.items():
         try:
             hss = _retry(client.open_by_key, sid, _label=f"open.completed.{hub}")
-            for r in _retry(hss.worksheet(COMPLETED_TAB).get_all_records,
-                            _label=f"completed.{hub}"):
+            recs = _retry(hss.worksheet(COMPLETED_TAB).get_all_records,
+                          _label=f"completed.{hub}")
+            for i, r in enumerate(recs, start=2):
                 rid = _normalize_rps(r.get("RPS_Number"))
                 if not rid or rid.upper() == "PREDICTED":
                     continue
+                queue_rows[hub].append((i, rid))
                 raw = str(r.get("End_Time") or "").strip()
                 if raw:
                     try:
@@ -1123,10 +1130,19 @@ def _load_master_extras(client):
                 if rc and "-" in rc:
                     fr, rest = rc.split("-", 1)
                     lanes[rid] = (fr.strip(), rest.split(";")[-1].strip())
+                th = str(r.get("Extra_Touching_Time") or "").strip()
+                if th:
+                    try:
+                        hh, mm, sec = (th.split(":") + ["0", "0"])[:3]
+                        hrs = int(hh) + int(mm) / 60 + int(sec) / 3600
+                        if hrs > 0:
+                            touch[rid] = hrs
+                    except ValueError:
+                        pass
         except Exception as exc:
             print(f"  [completed] '{hub}' unreadable ({str(exc)[:50]})",
                   flush=True)
-    return codes, index, ends, lanes
+    return codes, index, ends, lanes, touch, queue_rows
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1197,10 +1213,12 @@ def main():
     print(f"\n[rps_scraper] V2 MODE: {MODE.upper()}"
           + ("  — all writes go to the TESTING sheet only" if MODE != "live"
              else "  — writing LIVE trip sheets"), flush=True)
-    codes, index, t_ends, t_lanes = _load_master_extras(client)
+    codes, index, t_ends, t_lanes, t_touch, queue_rows = \
+        _load_master_extras(client)
     _V2["codes"], _V2["index"] = codes, index
     _TRACKER_ENDS.update(t_ends)
     _TRACKER_LANES.update(t_lanes)
+    _TRACKER_TOUCH.update(t_touch)
     print(f"  Hub List:    {len(codes)} codes for the v2 resolver", flush=True)
     print(f"  Tracker:     {len(t_ends)} GPS-verified end time(s), "
           f"{len(t_lanes)} verified lane(s)", flush=True)
@@ -1472,7 +1490,8 @@ def main():
         _sd, _ed = parse_dt_pair(first(rec, F_START), first(rec, F_END))
         if k and _ed:
             site_ends[k] = _ed
-    fixed_codes = fixed_ends = 0
+    fixed_codes = fixed_ends = fixed_touch = 0
+    merged_state: dict = {}
     if not args.dry_run:
         for sheet_id, cached in workbook_cache.items():
             ss2 = cached[0]
@@ -1484,7 +1503,7 @@ def main():
                 if not ws2.title.endswith("_MIS"):
                     continue
                 try:
-                    resp = _retry(ss2.values_get, f"'{ws2.title}'!A2:J",
+                    resp = _retry(ss2.values_get, f"'{ws2.title}'!A2:L",
                                   params={"valueRenderOption":
                                           "UNFORMATTED_VALUE"},
                                   _label=f"fix.{ws2.title}")
@@ -1510,36 +1529,127 @@ def main():
                             fixed_codes += 1
                             print(f"  [code-fix] {ws2.title} row {i}: "
                                   f"{cur} -> {better}", flush=True)
+                    # ── END TIME: the earliest proven time wins, in BOTH
+                    # directions, and blank cells fill regardless of trip
+                    # age. Only a cell holding one of the two MACHINE values
+                    # (proof no human touched it) may be adjusted.
+                    start_dt3 = _from_sheets_serial(row[8]
+                                                    if len(row) > 8 else None)
                     cell_end = _from_sheets_serial(row[9]
                                                    if len(row) > 9 else None)
+                    raw_end = str(row[9] if len(row) > 9 else "").strip()
                     t_end = _TRACKER_ENDS.get(key)
                     s_end = site_ends.get(key)
-                    if cell_end and t_end and s_end \
-                            and abs((cell_end - s_end).total_seconds()) <= 60 \
-                            and t_end < s_end - timedelta(minutes=2):
+                    cands = [x for x in (t_end, s_end) if x]
+                    best = min(cands) if cands else None
+                    if best and start_dt3 and best <= start_dt3:
+                        best = None          # physics: end must follow start
+                    end_final = cell_end
+                    if best:
+                        if not raw_end:
+                            do_it, why = True, "was blank"
+                        elif cell_end and any(
+                                abs((cell_end - m).total_seconds()) <= 60
+                                for m in cands) \
+                                and cell_end - best > timedelta(minutes=2):
+                            do_it, why = True, "earlier source wins"
+                        else:
+                            do_it, why = False, ""
+                        if do_it:
+                            reqs.append({"updateCells": {
+                                "rows": [{"values": [{
+                                    "userEnteredValue": {"numberValue":
+                                                         float(
+                                                             to_sheets_serial(
+                                                                 best))},
+                                    "userEnteredFormat": {"numberFormat":
+                                                          _datetime_fmt()},
+                                }]}],
+                                "fields": "userEnteredValue,"
+                                          "userEnteredFormat.numberFormat",
+                                "start": {"sheetId": ws2.id,
+                                          "rowIndex": i - 1,
+                                          "columnIndex": 9}}})
+                            fixed_ends += 1
+                            end_final = best
+                            print(f"  [end-fix] {ws2.title} row {i}: "
+                                  f"-> {best:%d/%m %H:%M} ({why})",
+                                  flush=True)
+                    # ── TOUCHING: blank Extra_Touching_Time (col L) filled
+                    # from the tracker's via measurements — the sheet's own
+                    # formulas then make Actual_Transit and Delay truthful
+                    raw_touch = str(row[11] if len(row) > 11 else "").strip()
+                    t_touch = _TRACKER_TOUCH.get(key)
+                    touch_final = bool(raw_touch)
+                    if t_touch and not raw_touch:
                         reqs.append({"updateCells": {
                             "rows": [{"values": [{
                                 "userEnteredValue": {"numberValue":
-                                                     float(to_sheets_serial(
-                                                         t_end))},
+                                                     t_touch / 24.0},
                                 "userEnteredFormat": {"numberFormat":
-                                                      _datetime_fmt()},
+                                                      _duration_fmt()},
                             }]}],
                             "fields": "userEnteredValue,"
                                       "userEnteredFormat.numberFormat",
                             "start": {"sheetId": ws2.id, "rowIndex": i - 1,
-                                      "columnIndex": 9}}})
-                        fixed_ends += 1
-                        print(f"  [end-fix] {ws2.title} row {i}: site "
-                              f"{s_end:%d/%m %H:%M} -> GPS {t_end:%d/%m %H:%M}"
-                              f" (earlier, cell untouched)", flush=True)
+                                      "columnIndex": 11}}})
+                        fixed_touch += 1
+                        touch_final = True
+                        print(f"  [touch-fix] {ws2.title} row {i}: "
+                              f"+{t_touch:.2f}h via touching", flush=True)
+                    # merge bookkeeping for the consume step
+                    st = merged_state.setdefault(key, {"end": False,
+                                                       "touch": False})
+                    st["end"] = st["end"] or bool(end_final or raw_end)
+                    st["touch"] = st["touch"] or touch_final
                 if reqs:
                     _guard_write(sheet_id)
                     _retry(ss2.batch_update, {"requests": reqs},
                            _label=f"fix.{ws2.title}.write")
-    if fixed_codes or fixed_ends:
+    if fixed_codes or fixed_ends or fixed_touch:
         print(f"[rps_scraper] corrections: {fixed_codes} Route_Code(s), "
-              f"{fixed_ends} End_Time(s) tightened by GPS", flush=True)
+              f"{fixed_ends} End_Time(s), {fixed_touch} touching fill(s)",
+              flush=True)
+
+    # ── CONSUME the queue: a Completed Trips row whose information is fully
+    # inside the trip sheet (end present; touching present when the tracker
+    # had one) has no reason to exist — delete it. Test mode only reports.
+    consumed = 0
+    for hub, entries in queue_rows.items():
+        to_del = []
+        for row_i, rid in entries:
+            st = merged_state.get(rid)
+            if not st or not st["end"]:
+                continue
+            if rid in _TRACKER_TOUCH and not st["touch"]:
+                continue
+            to_del.append((row_i, rid))
+        if not to_del:
+            continue
+        if MODE != "live":
+            print(f"  [consume] '{hub}': would delete "
+                  f"{len(to_del)} merged row(s) (test mode — kept)",
+                  flush=True)
+            continue
+        try:
+            hss = _retry(client.open_by_key, HUB_TRACKING_SHEETS[hub],
+                         _label=f"consume.open.{hub}")
+            cws = hss.worksheet(COMPLETED_TAB)
+            reqs = [{"deleteDimension": {"range": {
+                "sheetId": cws.id, "dimension": "ROWS",
+                "startIndex": ri - 1, "endIndex": ri}}}
+                for ri, _ in sorted(to_del, reverse=True)]
+            _retry(hss.batch_update, {"requests": reqs},
+                   _label=f"consume.{hub}")
+            consumed += len(to_del)
+            print(f"  [consume] '{hub}': {len(to_del)} merged row(s) "
+                  f"removed from the queue", flush=True)
+        except Exception as exc:
+            print(f"  [consume] '{hub}' failed ({str(exc)[:60]}) — rows "
+                  f"stay queued, retried next run", flush=True)
+    if consumed:
+        print(f"[rps_scraper] queue consumed: {consumed} trip(s) fully "
+              f"merged and removed", flush=True)
 
     # Final foreign-column sweep (defensive — bound Apps Scripts re-add it).
     print("\n[rps_scraper] Final foreign-column sweep…", flush=True)
