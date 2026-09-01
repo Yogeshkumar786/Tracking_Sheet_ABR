@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 .cache/
+
+# Never. This repository is public, and a service-account key pushed here is
+# compromised the moment it lands -- deleting the file afterwards does not help,
+# because it stays in the history and in GitHub's caches. The key belongs beside
+# the script on the machine that runs it, and nowhere else.
+credentials.json
+*credentials*.json
+.env
