@@ -327,6 +327,38 @@ def tab_name_for(start_dt: datetime) -> str:
     return f"{MONTHS[start_dt.month - 1]}_{start_dt.year}_MIS"
 
 
+def mis_tabs_for_window(from_dt: datetime, to_dt: datetime,
+                        margin_months: int = 1) -> set[str]:
+    """The _MIS tabs a run could possibly touch, given its date window.
+
+    The dedup scan used to read EVERY _MIS tab in every hub workbook. A new tab
+    appears each month and is never removed, so the cost of deduplicating two
+    days of trips grew without limit -- five workbooks times every month the
+    business has ever traded, with a one-second pause between each. At a
+    fifteen-minute schedule that alone would exceed the read quota.
+
+    A trip can only already exist in a tab covering its own start date, so the
+    window decides what has to be read. The margin is not optional: a trip that
+    starts on the 31st can be filed under the following month, and one recorded
+    just after midnight can be filed under the previous, so a month either side
+    is read as well.
+
+    This keeps a backfill correct. --month 2026-05 reads April, May and June and
+    still finds anything already written; only the months that cannot contain
+    the fetched trips are skipped.
+    """
+    months: set[tuple[int, int]] = set()
+    y, m = from_dt.year, from_dt.month
+    while (y, m) <= (to_dt.year, to_dt.month):
+        months.add((y, m))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    for _ in range(margin_months):
+        for (yy, mm) in list(months):
+            months.add((yy - 1, 12) if mm == 1 else (yy, mm - 1))
+            months.add((yy + 1, 1) if mm == 12 else (yy, mm + 1))
+    return {f"{MONTHS[mm - 1]}_{yy}_MIS" for (yy, mm) in months}
+
+
 # ── gspread bootstrap ─────────────────────────────────────────────────────────
 
 def gspread_client():
@@ -722,16 +754,25 @@ class DedupReadError(Exception):
     """
 
 
-def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int, bool, bool]]]:
-    """Scan every *_MIS tab and collect existing RPS numbers + back-fill
-    candidates.  Raises DedupReadError if any tab can't be read — we'd
-    rather skip writes than duplicate.
+def existing_rps_in_workbook(ss, want_tabs: set[str] | None = None
+                             ) -> tuple[set[str], dict[str, tuple[str, int, bool, bool]]]:
+    """Collect existing RPS numbers + back-fill candidates from the _MIS tabs
+    this run could touch.  Raises DedupReadError if any tab it needs can't be
+    read — we'd rather skip writes than duplicate.
+
+    want_tabs is the set from mis_tabs_for_window(); None means every _MIS tab,
+    which is what this always used to do and is still what a caller with no
+    window should get.
     """
     all_rps:  set[str] = set()
     backfill: dict[str, tuple[str, int, bool, bool]] = {}
     worksheets = _retry(ss.worksheets, _label=f"{ss.id}.worksheets")
+    skipped = 0
     for ws in worksheets:
         if not ws.title.endswith("_MIS"):
+            continue
+        if want_tabs is not None and ws.title not in want_tabs:
+            skipped += 1
             continue
         # Tiny pause between tabs softens the read-quota pressure.
         time.sleep(1.0)
@@ -775,6 +816,9 @@ def existing_rps_in_workbook(ss) -> tuple[set[str], dict[str, tuple[str, int, bo
                 backfill.pop(key, None)
         print(f"  [dedup] {ws.title}: {loaded} RPS row(s); "
               f"{backfill_candidates} needing backfill", flush=True)
+    if skipped:
+        print(f"  [dedup] skipped {skipped} _MIS tab(s) outside the window",
+              flush=True)
     print(f"  [dedup] Workbook totals: {len(all_rps)} known RPS, "
           f"{len(backfill)} awaiting backfill "
           f"(start={sum(1 for _,_,ns,_ in backfill.values() if ns)}, "
@@ -990,13 +1034,23 @@ def fetch_rps_trips(vehicles: list[str],
 
 # ── V2: global registry + tracker data ───────────────────────────────────────
 
-def _scan_live_workbooks(client) -> tuple[set, dict]:
-    """READ-ONLY sweep of every live hub workbook's *_MIS tabs. Returns
-    (all RPS numbers anywhere, route-text -> most common Route_Code).
-    Cached on disk for 24h — this is the heavy scan the registry replaces."""
+def _scan_live_workbooks(client, want_tabs: set[str] | None = None) -> tuple[set, dict]:
+    """READ-ONLY sweep of the live hub workbooks' *_MIS tabs. Returns
+    (all RPS numbers found, route-text -> most common Route_Code).
+    Cached on disk for 24h — this is the heavy scan the registry replaces.
+
+    want_tabs limits it to the months the run could touch; see
+    mis_tabs_for_window(). None means every _MIS tab."""
     try:
         raw = json.loads(REGISTRY_CACHE.read_text(encoding="utf-8"))
-        if time.time() - raw["ts"] <= REGISTRY_CACHE_TTL_H * 3600:
+        # A cache built for a narrower window must not be handed to a wider one.
+        # A two-day run and a --month backfill need different months, and reusing
+        # the first for the second would report trips as new that already exist.
+        covered = raw.get("tabs")
+        usable = (want_tabs is None and covered is None) or (
+            want_tabs is not None and covered is not None
+            and want_tabs.issubset(set(covered)))
+        if usable and time.time() - raw["ts"] <= REGISTRY_CACHE_TTL_H * 3600:
             print(f"  [registry] {len(raw['rps'])} known RPS from cache",
                   flush=True)
             return set(raw["rps"]), dict(raw["hist"])
@@ -1019,6 +1073,8 @@ def _scan_live_workbooks(client) -> tuple[set, dict]:
             ss = _retry(client.open_by_key, sid, _label=f"open({hub})")
             for ws in _retry(ss.worksheets, _label=f"{hub}.worksheets"):
                 if not ws.title.endswith("_MIS"):
+                    continue
+                if want_tabs is not None and ws.title not in want_tabs:
                     continue
                 time.sleep(1.0)
                 resp = _retry(ss.values_get, f"'{ws.title}'!A2:J",
@@ -1043,7 +1099,8 @@ def _scan_live_workbooks(client) -> tuple[set, dict]:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         REGISTRY_CACHE.write_text(json.dumps(
-            {"ts": time.time(), "rps": sorted(all_rps), "hist": hist}),
+            {"ts": time.time(), "rps": sorted(all_rps), "hist": hist,
+             "tabs": None if want_tabs is None else sorted(want_tabs)}),
             encoding="utf-8")
     except Exception:
         pass
@@ -1222,7 +1279,10 @@ def main():
     print(f"  Hub List:    {len(codes)} codes for the v2 resolver", flush=True)
     print(f"  Tracker:     {len(t_ends)} GPS-verified end time(s), "
           f"{len(t_lanes)} verified lane(s)", flush=True)
-    global_rps, hist = _scan_live_workbooks(client)
+    want_tabs = mis_tabs_for_window(from_dt, to_dt)
+    print(f"[rps_scraper] dedup scope: {len(want_tabs)} month tab(s) — "
+          f"{', '.join(sorted(want_tabs))}", flush=True)
+    global_rps, hist = _scan_live_workbooks(client, want_tabs)
     _V2["hist"] = hist
     reg_ss, reg_ws, reg_keys = _load_registry_tab(client)
     global_rps |= reg_keys
@@ -1298,7 +1358,7 @@ def main():
             ss = _retry(client.open_by_key, sheet_id,
                         _label=f"open_by_key({hub})")
             try:
-                all_rps, backfill = existing_rps_in_workbook(ss)
+                all_rps, backfill = existing_rps_in_workbook(ss, want_tabs)
             except DedupReadError as exc:
                 # CRITICAL: refuse to write to this workbook on a failed
                 # dedup.  Otherwise we'd treat every API row as "new" and
