@@ -477,6 +477,27 @@ _TRACKER_ENDS: dict = {}   # rps -> GPS-verified end (from Completed Trips)
 _TRACKER_LANES: dict = {}  # rps -> (from_code, to_code) the tracker verified
 _TRACKER_TOUCH: dict = {}  # rps -> via touching hours the tracker measured
 
+# A vehicle is allowed two hours at a via hub before any of it counts against
+# the trip. Three hours at a hub is therefore one hour charged, not three.
+#
+# The allowance is per TRIP, not per via, because that is the only thing this
+# script can see: the tracker sums every via into a single figure per RPS and
+# writes that to its own board, which is what gets read back here. A per-via
+# allowance would have to be applied in the tracker, where the individual
+# dwells still exist.
+#
+# Only the charged figure goes in the cell -- the sheet's Actual_Transit and
+# Delay formulas read it, so they stay honest without knowing about any of
+# this. What was really measured goes in the cell's note, so nobody has to take
+# the number on faith.
+TOUCH_GRACE_H = 2.0
+
+
+def _hhmm(hours: float) -> str:
+    """Hours as h:mm, for the cell note. 1.5 -> '1:30'."""
+    m = int(round(float(hours) * 60))
+    return f"{m // 60}:{m % 60:02d}"
+
 
 def _from_sheets_serial(v) -> datetime | None:
     """Inverse of to_sheets_serial — a Sheets datetime serial back to naive dt."""
@@ -1641,22 +1662,38 @@ def main():
                     raw_touch = str(row[11] if len(row) > 11 else "").strip()
                     t_touch = _TRACKER_TOUCH.get(key)
                     touch_final = bool(raw_touch)
-                    if t_touch and not raw_touch:
+                    if t_touch is not None and not raw_touch:
+                        # Under the allowance the cell reads zero; the trip is
+                        # not charged for a stop it was entitled to make. Over
+                        # it, only the excess is charged.
+                        charged = max(0.0, t_touch - TOUCH_GRACE_H)
+                        if charged:
+                            note = (f"Via touching {_hhmm(t_touch)} measured. "
+                                    f"{_hhmm(TOUCH_GRACE_H)} grace waived, "
+                                    f"{_hhmm(charged)} charged.")
+                        else:
+                            note = (f"Via touching {_hhmm(t_touch)} measured — "
+                                    f"within the {_hhmm(TOUCH_GRACE_H)} grace, "
+                                    f"so nothing is charged.")
                         reqs.append({"updateCells": {
                             "rows": [{"values": [{
                                 "userEnteredValue": {"numberValue":
-                                                     t_touch / 24.0},
+                                                     charged / 24.0},
                                 "userEnteredFormat": {"numberFormat":
                                                       _duration_fmt()},
+                                # The working, on the cell itself. No new column,
+                                # so nothing downstream of this sheet moves.
+                                "note": note,
                             }]}],
-                            "fields": "userEnteredValue,"
+                            "fields": "userEnteredValue,note,"
                                       "userEnteredFormat.numberFormat",
                             "start": {"sheetId": ws2.id, "rowIndex": i - 1,
                                       "columnIndex": 11}}})
                         fixed_touch += 1
                         touch_final = True
                         print(f"  [touch-fix] {ws2.title} row {i}: "
-                              f"+{t_touch:.2f}h via touching", flush=True)
+                              f"measured {t_touch:.2f}h, charged "
+                              f"{charged:.2f}h via touching", flush=True)
                     # merge bookkeeping for the consume step
                     st = merged_state.setdefault(key, {"end": False,
                                                        "touch": False})
