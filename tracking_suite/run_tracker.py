@@ -184,6 +184,8 @@ def main():
         hubs = hublist.load(ss)
         index = tracker.build_index(hubs["names"])
     tats = tracker.learn_tats(trips_by, hubs["cluster"])
+    paces = tracker.learn_paces(trips_by, tracker.Atlas(hubs, index))
+    print(f"  [ETA] {len(paces)} lane pace(s) learned from trip history", flush=True)
     print(f"  [TAT] {len(tats)} lane timetable(s) learned from trip history",
           flush=True)
     _lap("pending-hub check + TAT learning")
@@ -256,7 +258,8 @@ def main():
                                 existing_rows.get(vno, {}), now,
                                 sheet_tats=sheet_tats,
                                 pre_trail=trails.get(vno),
-                                via_prior=via_by_vt.get((vno, tid)))
+                                via_prior=via_by_vt.get((vno, tid)),
+                                paces=paces)
         rows.append(row)
         if i % 40 == 0:
             print(f"    [{i}/{len(on_fms)}]", flush=True)

@@ -37,6 +37,7 @@ in exactly one place.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -49,11 +50,22 @@ from tracking_suite import ghost as ghostmod
 from tracking_suite import viatouch
 from tracking_suite.presence import haversine_m
 
+
+def _sane_fix(la, lo) -> bool:
+    """A fix inside India's bounding box. Trackers emit (0, 0) and near-zero
+    junk after a reboot; one such point teleports a truck thousands of km and
+    poisons every speed, stop and ETA figure downstream. Checked at every door
+    a point comes in by: the live fix, fresh trail pings, and the trail cache."""
+    try:
+        return 6.0 <= float(la) <= 37.5 and 68.0 <= float(lo) <= 97.5
+    except (TypeError, ValueError):
+        return False
+
 # ── board vocabulary (unchanged) ─────────────────────────────────────────────
 
 HEADERS = ["Trip ID", "Vehicle No", "Vehicle Type", "From", "To", "Via Point",
            "TAT", "DEP Date&Time", "SCH Arrival Date&Time",
-           "Actual Arrival Date&Time", "Status", "Performance",
+           "ETA Date&Time", "Actual Arrival Date&Time", "Status", "Performance",
            "Current Location", "Late Hrs", "Remark", "ARRIVAL STATUS"]
 
 S_RUNNING = "RUNNING"
@@ -213,7 +225,7 @@ def read_fix(live: dict, now: datetime, dep: datetime | None,
              ev: Evidence) -> Fix:
     lat, lon = fms.position(live)
     t = fms.last_gps_dt(live)
-    if not (lat and lon and t):
+    if not (t and _sane_fix(lat, lon)):
         ev.refuse("position", "no usable GPS fix")
         return Fix()
     age = (now - t).total_seconds() / 3600
@@ -361,7 +373,7 @@ def _fetch_range(vid: int, frm: datetime, to: datetime) -> list:
         except (TypeError, ValueError):
             continue
         dt = _ping_dt(p)
-        if la and lo and dt and dt <= to + timedelta(minutes=5):
+        if _sane_fix(la, lo) and dt and dt <= to + timedelta(minutes=5):
             pts.append((dt, la, lo))
     return pts
 
@@ -381,7 +393,8 @@ def fetch_trail(live: dict, now: datetime, hours: float = TRAIL_HOURS) -> list:
     try:
         import json as _json
         raw = _json.loads(cachef.read_text(encoding="utf-8"))
-        cached = [(datetime.fromisoformat(t), la, lo) for t, la, lo in raw]
+        cached = [(datetime.fromisoformat(t), la, lo) for t, la, lo in raw
+                  if _sane_fix(la, lo)]
     except Exception:
         cached = []
     keep_from = now - timedelta(hours=_TRAIL_KEEP_H)
@@ -448,12 +461,57 @@ def stay_at(trail: list, hlat: float, hlon: float, radius_m: float):
     return entered, exited
 
 
+_APPROACH_FILE = Path(__file__).resolve().parent / "approach_pace.json"
+_APPROACH: dict | None = None
+
+
+def _approach_table() -> dict:
+    global _APPROACH
+    if _APPROACH is None:
+        try:
+            import json as _json
+            _APPROACH = _json.loads(_APPROACH_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _APPROACH = {}
+    return _APPROACH
+
+
+def approach_hours(rem_km: float, dest: str) -> float | None:
+    """Hours to close the last `rem_km` (straight line, outside the destination
+    boundary) into `dest`, at the pace trucks were measured closing that last
+    stretch (approach_pace.json): per destination when it has the samples,
+    else all destinations. The horizon comes from the distance itself, never
+    from a known arrival: a first guess at 32 km/h, then once more at the pace
+    that guess implies."""
+    t = _approach_table()
+    hz = t.get("horizons_h") or []
+    if not hz or rem_km <= 0:
+        return None
+
+    def look(h):
+        row = (t.get("by_dest") or {}).get(dest, {}).get(str(h))             or (t.get("all") or {}).get(str(h))
+        return row[0] if row and row[0] > 0 else None
+
+    def near(x):
+        return min(hz, key=lambda h: abs(math.log(max(x, 0.05) / h)))
+
+    p = look(near(rem_km / 32.0))
+    if not p:
+        return None
+    p = look(near(rem_km / p)) or p
+    return rem_km / p
+
+
 def interp_arrival(trail: list, entered: datetime, fix: Fix,
-                   ev: Evidence) -> datetime:
+                   ev: Evidence, dest: str = "",
+                   atlas: "Atlas | None" = None) -> datetime:
     """The blackout case: last fix OUTSIDE the hub at T1, GPS gap, first fix
-    AT the hub at T2. The truck reached somewhere inside (T1, T2] — estimate
-    where with its own road speed, clamped inside the gap. Gap <= 15 min or
-    speed unknown -> keep T2 (the confirmed-by time)."""
+    AT the hub at T2. The truck reached the boundary somewhere inside (T1, T2].
+    Place it with the pace trucks close the last stretch into this destination
+    (D9, 2026-09-11): the truck's own road speed runs too fast near the gate,
+    so it landed early and got worse with the silence (66 min early at 4 h,
+    141 min at 10 h, on 202 GPS-seen arrivals). No pace table -> the old
+    own-speed estimate. Gap <= 15 min -> keep T2 (the confirmed-by time)."""
     prev = None
     for p in trail:
         if p[0] < entered:
@@ -465,18 +523,26 @@ def interp_arrival(trail: list, entered: datetime, fix: Fix,
     gap_h = (entered - prev[0]).total_seconds() / 3600
     if gap_h * 60 <= 15:
         return entered
-    v_hat, _, _ = estimator.speed_state(
-        [p for p in trail if p[0] <= prev[0]], prev[0])
-    if not v_hat or v_hat < 5:
-        return entered
-    d_km = haversine_m(prev[1], prev[2], fix.lat, fix.lon) / 1000
-    est = prev[0] + timedelta(hours=d_km / v_hat)
+    est, basis = None, ""
+    if dest and atlas is not None and dest in atlas.by_code:
+        dla, dlo = atlas.by_code[dest][:2]
+        rem_km = (haversine_m(prev[1], prev[2], dla, dlo)
+                  - atlas.rad(dest)) / 1000
+        h = approach_hours(rem_km, dest)
+        if h:
+            est, basis = prev[0] + timedelta(hours=h), "approach pace"
+    if est is None:
+        v_hat, _, _ = estimator.speed_state(
+            [p for p in trail if p[0] <= prev[0]], prev[0])
+        if not v_hat or v_hat < 5:
+            return entered
+        d_km = haversine_m(prev[1], prev[2], fix.lat, fix.lon) / 1000
+        est, basis = prev[0] + timedelta(hours=d_km / v_hat), "own speed"
     if not (prev[0] < est < entered):
         return entered              # physics says it needed the whole gap
-    ev.log(f"arrival ~{est:%H:%M} (est, interpolated across "
+    ev.log(f"arrival ~{est:%H:%M} (est, {basis}, across "
            f"{gap_h:.1f}h GPS gap)")
     return est
-
 
 def stopped(trail: list, fix: Fix, live: dict, ev: Evidence) -> bool:
     """THE motion authority. Trail first; site hint only as a recorded fallback."""
@@ -579,6 +645,28 @@ def learn_tats(trips_by_veh: dict, cluster: dict) -> dict:
     return {k: (median(v), len(v)) for k, v in runs.items()}
 
 
+def learn_paces(trips_by_veh: dict, atlas: "Atlas") -> dict:
+    """{(o_region, d_region): median straight-line km/h from dispatch to FMS
+    closure}, lanes with >= 3 closed runs. The pace an ETA divides the distance
+    left by. Measured 2026-09-11 on the week-long board replay: median ETA
+    error 1.2 h (0.5 h once under 6 h out), against 3.5 h for DEP + TAT."""
+    runs: dict = {}
+    for trips in trips_by_veh.values():
+        for t in trips:
+            s_, e_ = t.get("start_dt"), t.get("end_dt")
+            o = atlas.resolve_ident(t.get("origin", "")) or t.get("origin", "")
+            d = atlas.resolve_ident(t.get("dest", "")) or t.get("dest", "")
+            if not (s_ and e_) or o not in atlas.by_code or d not in atlas.by_code:
+                continue
+            ro, rd = atlas.region(o), atlas.region(d)
+            h = (e_ - s_).total_seconds() / 3600
+            (la1, lo1), (la2, lo2) = atlas.by_code[o][:2], atlas.by_code[d][:2]
+            km = haversine_m(la1, lo1, la2, lo2) / 1000
+            if ro != rd and 1.0 < h < 200 and km > 20:
+                runs.setdefault((ro, rd), []).append(km / h)
+    return {k: median(v) for k, v in runs.items() if len(v) >= 3}
+
+
 def distance_tat(atlas: Atlas, origin: str, dest: str) -> float | None:
     """Fallback TAT when no run history exists for the lane: straight-line
     distance x 1.45 road factor at 32 km/h effective (incl. rests). Coarse by
@@ -639,7 +727,8 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
               hubs: dict, index: list, tats: dict, existing: dict,
               now: datetime, sheet_tats: dict | None = None,
               pre_trail: list | None = None,
-              via_prior: list | None = None) -> dict:
+              via_prior: list | None = None,
+              paces: dict | None = None) -> dict:
     atlas = Atlas(hubs, index)
     ev = Evidence()
     row = {h: "" for h in HEADERS}
@@ -669,8 +758,25 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
     # 1 · trip context (site timestamps pass the gate exactly once)
     trip = read_trip(live, trips, atlas, now, ev)
     if manual_trip and not _same_trip_id(manual_trip, trip.trip_id):
-        ev.note("trip id manual" + (f" (site: {trip.trip_id})" if trip.trip_id else ""))
-        trip.trip_id = manual_trip
+        # The board reads its own previous Trip ID back as `manual_trip`, so a
+        # trip that never reached COMPLETED (destination not in the Hub List,
+        # arrival missed) used to override every trip the site filed after
+        # it. An id that is itself a FILED trip of this vehicle, older than
+        # the one the site shows now, is last trip's id — the site's trip wins.
+        # A hand-typed id for an unfiled trip is not in the history: kept.
+        rank = {str(t_.get("rps") or "").strip().lstrip("0"): i
+                for i, t_ in enumerate(trips)}          # trips: newest first
+        carried = rank.get(manual_trip.lstrip("0"))
+        shown = rank.get((trip.trip_id or "").strip().lstrip("0"))
+        if trip.trip_id and carried is not None \
+                and (shown is None or shown < carried):
+            ev.log(f"trip {manual_trip} closed — site now shows {trip.trip_id}")
+            manual_trip = ""
+            prev_completed = True     # the old trip's journal leaves with it
+        else:
+            ev.note("trip id manual"
+                    + (f" (site: {trip.trip_id})" if trip.trip_id else ""))
+            trip.trip_id = manual_trip
     # FALLBACK: a trip id whose details the dashboard doesn't carry (manual id,
     # or site gave the id but nothing else) — look the id up in the vehicle's
     # own RPS history and take route/departure from there.
@@ -799,11 +905,81 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
                 entered = e2 or entered
                 used = longer
         if entered:
-            entered = interp_arrival(used, entered, fix, ev)
+            entered = interp_arrival(used, entered, fix, ev,
+                                     dest=trip.dest, atlas=atlas)
         arrived = check_event(entered or fms.stopped_since(live) or fix.t,
                               trip.dep, now, fix, "arrival", ev)
+    # 5b · FMS closed the trip. Measured on this fleet: at the closure the
+    # truck was within 2 km of its destination in 57 of 57 closures — FMS
+    # closes on arrival. When the stopped-at-destination check above never
+    # caught it (a short stop between runs, still manoeuvring in the yard, or
+    # a destination with no Hub List pin to check against), the closure stands
+    # in, so the trip completes instead of reading IN TRANSIT for ever.
+    if trip.active and not arrived and trip.trip_id and trip.dep:
+        filed = next((t_ for t_ in trips
+                      if _same_trip_id(t_.get("rps", ""), trip.trip_id)), None)
+        closed = filed.get("end_dt") if filed else None
+        if closed and trip.dep <= closed <= now:
+            if trip.dest in atlas.by_code:
+                look = trail
+                if not look or look[0][0] > closed - timedelta(minutes=30):
+                    span = (now - closed).total_seconds() / 3600 + 1
+                    look = fetch_trail(live, now,
+                                       hours=min(TRAIL_EXT_HOURS, span))
+                around = [p for p in (look or [])
+                          if abs((p[0] - closed).total_seconds()) <= 1800]
+                dla, dlo = atlas.by_code[trip.dest]
+                if around:
+                    gap = min(haversine_m(la, lo, dla, dlo)
+                              for _, la, lo in around)
+                    if gap <= max(atlas.rad(trip.dest), 2000.0):
+                        arrived = closed
+                        ev.log(f"arrived {closed:%H:%M} (FMS closed the trip, "
+                               f"GPS at {trip.dest})")
+                    else:
+                        ev.note(f"FMS closed the trip but GPS was "
+                                f"{gap / 1000:.0f} km from {trip.dest} — "
+                                f"check the Hub List pin")
+                else:
+                    arrived = closed
+                    ev.log(f"arrived {closed:%H:%M} per FMS closure "
+                           f"(unverified — no GPS around it)")
+            else:
+                arrived = closed
+                ev.log(f"arrived {closed:%H:%M} per FMS closure (unverified — "
+                       f"{trip.dest or 'destination'} has no Hub List pin)")
     if arrived:
         row["Actual Arrival Date&Time"] = arrived.strftime(_DT_OUT)
+
+    # 5c · ETA — distance left (straight line to the destination pin) at the
+    # lane's own pace, learned from past trips (learn_paces). No lane pace yet:
+    # TAT x share of the distance left (replay: 1.6 h median error). A silent
+    # truck is projected from where it was last seen; when that projection has
+    # already passed, the row says so instead of showing a time in the past.
+    if trip.active and not arrived and trip.dest in atlas.by_code             and fix.t is not None and (fix.lat or fix.raw_lat):
+        dla, dlo = atlas.by_code[trip.dest][:2]
+        pla, plo = (fix.lat, fix.lon) if fix.fresh else (fix.raw_lat, fix.raw_lon)
+        left_km = haversine_m(pla, plo, dla, dlo) / 1000
+        eta_h, basis = None, ""
+        if left_km * 1000 > atlas.rad(trip.dest):
+            pace = (paces or {}).get((atlas.region(trip.origin),
+                                      atlas.region(trip.dest)))                 if trip.origin in atlas.by_code else None
+            if pace:
+                eta_h, basis = left_km / pace, "lane pace"
+            elif tat_h and trip.origin in atlas.by_code:
+                ola, olo = atlas.by_code[trip.origin][:2]
+                total_km = haversine_m(ola, olo, dla, dlo) / 1000
+                if total_km > 20:
+                    eta_h, basis = tat_h * min(1.0, left_km / total_km),                         "TAT share"
+        if eta_h is not None:
+            eta = fix.t + timedelta(hours=eta_h)
+            if eta < now and not fix.fresh:
+                ev.note(f"should have reached {trip.dest} by "
+                        f"{eta:%d/%m %H:%M} on pace (GPS silent) — check")
+            else:
+                row["ETA Date&Time"] = max(eta, now).strftime(_DT_OUT)
+                if basis != "lane pace":
+                    ev.note(f"ETA from {basis} (no lane pace yet)")
 
     # 6 · vias — the touching engine (viatouch.py). One verdict per via, in
     # route order, hiccup-tolerant: clean stays CONFIRMED, gap-edged stays

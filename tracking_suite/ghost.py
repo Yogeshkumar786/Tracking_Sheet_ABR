@@ -28,7 +28,7 @@ from tracking_suite.presence import haversine_m
 MIN_AWAY_KM = 20.0      # closer than this to the origin hub = not a trip yet
 MIN_DWELL_MIN = 45.0    # a shorter hub stay is a pass-through, not a loading
 MAX_DEP_AGE_H = 48.0    # a hub exit older than this is another story entirely
-LOCK_CONF = 0.80        # at/above this the lane is locked onto the board
+LOCK_CONF = 0.60        # at/above this the lane is locked onto the board (0.80 -> 0.60, 2026-09-11 replay: 55 -> 85 of 122 trips named, first lock right 99%)
 DETOUR_MAX = 1.30       # (d(o,p)+d(p,d))/d(o,d) beyond this = not on that lane
 MIN_PROGRESS = 0.03     # must have closed >=3% of the origin->dest distance
 VIA_BOOST = 3.0         # trail passed a lane's via hub -> that lane's odds x3
