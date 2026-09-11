@@ -95,6 +95,7 @@ TRAIL_EXT_HOURS = 24 * 7
 VIA_NEAR_KM = 60.0
 MIN_TAT_RUNS = 2
 MOVE_KM_PER_HR = 2.0   # trail movement below this over an hour = stopped
+NAME_CONFIRM_M = 3000.0  # a hub named from FMS text must sit this close to the GPS
 
 _DT_OUT = "%d/%m/%Y %H:%M:%S"
 
@@ -327,11 +328,22 @@ class Atlas:
         if m and m.group(1).upper() in self.by_code:
             c = m.group(1).upper()
             return Place(c, self.region(c), c, "loc-code")
-        c = self.resolve_ident(loc_text)
-        if c:
-            return Place(c, self.region(c), c, "name")
-        t = re.sub(r'\([^)]*\)', '', loc_text or '').strip()
-        return Place("", "", t[:28], "none")
+        # A hub NAME is trusted only when FMS says the truck is AT / near a
+        # Safexpress hub AND that hub's pin agrees with the GPS. FMS texts end
+        # in village-district-state ("...-thane-maharashtra"); searching hub
+        # names inside them put trucks at hubs they were nowhere near (measured
+        # 2026-09-11: 43 of 48 such guesses >10 km off; "mahARAshtra" -> ARA01
+        # Ara, Bihar, 1,366 km). No proof -> FMS's own words, never a guess.
+        txt = (loc_text or "").strip()
+        if re.match(r"^(AT|NEAR)\b", txt, re.I) and "SAFEXPRESS" in txt.upper():
+            c = self.resolve_ident(txt)
+            la, lo = (fix.lat, fix.lon) if fix.fresh else (fix.raw_lat, fix.raw_lon)
+            if c and c in self.by_code and la and lo and haversine_m(
+                    la, lo, *self.by_code[c][:2]) <= NAME_CONFIRM_M:
+                return Place(c, self.region(c), c, "name")
+        t = re.sub(r'\([^)]*\)', '', txt).strip()
+        t = " ".join(t.split())
+        return Place("", "", t[:60], "none")
 
 
 def _norm(s: str) -> str:

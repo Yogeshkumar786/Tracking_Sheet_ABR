@@ -389,6 +389,7 @@ class _Batch:
 
 
 _DUR_FMT = {"numberFormat": {"type": "TIME", "pattern": "[h]:mm:ss"}}
+ROW_PX = 21        # Tracking rows stay one line tall, whatever the Remark holds
 _F_DUR = "userEnteredFormat.numberFormat"
 _F_HDR = "userEnteredFormat(backgroundColor,textFormat)"
 
@@ -432,6 +433,15 @@ def _write(ss, title, rows, now, batch):
         batch.fmt(sid, 1, last, c, c + 1, _DUR_FMT, _F_DUR)
     batch.fmt(sid, 0, 1, 0, len(tracker.HEADERS), _hdr_fmt(), _F_HDR)
     batch.freeze(sid)
+    # one line per row, always. The Remark journal holds several lines, and a
+    # sheet auto-grows any row whose cell has line breaks. Clip the text (the
+    # full remark stays in the cell: click it to read) and pin the height.
+    batch.fmt(sid, 1, last, 0, len(tracker.HEADERS),
+              {"wrapStrategy": "CLIP"}, "userEnteredFormat.wrapStrategy")
+    batch.reqs.append({"updateDimensionProperties": {
+        "range": {"sheetId": sid, "dimension": "ROWS",
+                  "startIndex": 1, "endIndex": last},
+        "properties": {"pixelSize": ROW_PX}, "fields": "pixelSize"}})
 
     def dv(col_idx, values):
         return {"setDataValidation": {
