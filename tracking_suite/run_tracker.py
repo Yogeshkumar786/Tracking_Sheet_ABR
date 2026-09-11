@@ -249,6 +249,7 @@ def main():
           flush=True)
     _lap("GPS trails, 8 at a time")
 
+    last_status = _load_last_status()
     rows = []
     for i, vno in enumerate(on_fms, 1):
         live = live_by[vno]
@@ -259,7 +260,8 @@ def main():
                                 sheet_tats=sheet_tats,
                                 pre_trail=trails.get(vno),
                                 via_prior=via_by_vt.get((vno, tid)),
-                                paces=paces)
+                                paces=paces,
+                                last_status=last_status.get(vno))
         rows.append(row)
         if i % 40 == 0:
             print(f"    [{i}/{len(on_fms)}]", flush=True)
@@ -291,6 +293,7 @@ def main():
               f"matches no hub workbook — on no board: "
               + ", ".join(unassigned[:8])
               + ("…" if len(unassigned) > 8 else ""), flush=True)
+    written = {}
     for hub, hss in hub_ss.items():
         hpre = hub_pre.get(hub, {})
         kept = [p for p in hub_order.get(hub, []) if hub_of.get(p) == hub]
@@ -310,8 +313,11 @@ def main():
         _via_write(hss, "Via Touching", hrows, now, hb,
                    cur=hpre.get("Via Touching", []))
         hb.flush()
+        written.update({x["Vehicle No"]: (x.get("Status") or "")
+                        for x in ordered_h})
         print(f"  [Hub board] '{hub}': {len(ordered_h)} vehicle(s) — "
               f"tracking/extra/completed/via written", flush=True)
+    _save_last_status(written)
     _lap("write everything back (per hub)")
     _tot = sum(x for _, x in _timing)
     print(f"\n  [Timing] {_tot:.0f}s total — where the time went:", flush=True)
@@ -323,6 +329,32 @@ def main():
     # (the Hub List lives on the master by the user's rule)
     _request_pending_hubs(ss, hubs, rows, trips_by, now)
     print("\n  Done.\n", flush=True)
+
+
+_LAST_STATUS = Path(__file__).resolve().parent / ".cache" / "last_status.json"
+
+
+def _load_last_status() -> dict:
+    """C3: the Status the tracker wrote per vehicle on its last run. Missing
+    or unreadable -> {}: every vehicle 'unknown', so no hand edit is claimed."""
+    try:
+        import json as _json
+        return _json.loads(_LAST_STATUS.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_last_status(written: dict):
+    try:
+        import json as _json
+        import os as _os
+        _LAST_STATUS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _LAST_STATUS.with_suffix(".tmp")
+        tmp.write_text(_json.dumps(written), encoding="utf-8")
+        _os.replace(tmp, _LAST_STATUS)
+    except Exception as exc:
+        print(f"  [WARN] last-status memory not saved: {str(exc)[:60]}",
+              flush=True)
 
 
 def _report(rows):
@@ -460,6 +492,7 @@ def _write(ss, title, rows, now, batch):
         dv(tracker.HEADERS.index("ARRIVAL STATUS"), tracker.ARRIVAL_VALUES),
     ]
     _paint(ws, rows, title, batch)
+    _status_rules(ss, ws, batch)
 
 
 # ── the colour language (agreed on the Ghost Trips page) ─────────────────────
@@ -498,6 +531,118 @@ def _delay_shade(late_hours):
     return RED3_BG, RED3_FG
 
 
+def _col_letter(i: int) -> str:
+    s, n = "", i + 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _cf_rules() -> list:
+    """C1: every value-driven colour as a conditional-format rule, in the
+    order Sheets evaluates them (the first matching rule colours the cell).
+    Each entry: (column index, condition, background, text colour)."""
+    H = tracker.HEADERS.index
+    perf, late = _col_letter(H("Performance")), _col_letter(H("Late Hrs"))
+    delay = tracker.P_DELAY
+
+    def eq(col, text, bg, fg):
+        return (H(col), {"type": "TEXT_EQ",
+                         "values": [{"userEnteredValue": text}]}, bg, fg)
+
+    def formula(col, f, bg, fg):
+        return (H(col), {"type": "CUSTOM_FORMULA",
+                         "values": [{"userEnteredValue": f}]}, bg, fg)
+
+    return [
+        eq("Status", tracker.S_RUNNING, OK_BG, OK_FG),
+        eq("Status", tracker.S_LOADING, AMBER_BG, AMBER_FG),
+        eq("Status", tracker.S_UNLOADING, ORANGE_BG, ORANGE_FG),
+        eq("Status", tracker.S_AT_VIA, BLUE_BG, BLUE_FG),
+        eq("Status", tracker.S_REVIEW, REVIEW_BG, REVIEW_FG),
+    ] + [eq("Status", m, GREY_BG, GREY_FG)
+         for m in sorted(tracker.MANUAL_STATUSES)] + [
+        eq("ARRIVAL STATUS", tracker.A_TRANSIT, BLUE_BG, BLUE_FG),
+        eq("ARRIVAL STATUS", tracker.A_COMPLETED, OK_BG, OK_FG),
+        eq("ARRIVAL STATUS", tracker.A_NOT_ON_TRIP, GREY_BG, GREY_FG),
+        eq("Performance", tracker.P_ONTIME, OK_BG, OK_FG),
+        formula("Performance", f'=AND(${perf}2="{delay}",N(${late}2)*24>=24)',
+                RED3_BG, RED3_FG),
+        formula("Performance", f'=AND(${perf}2="{delay}",N(${late}2)*24>=6)',
+                RED2_BG, RED2_FG),
+        eq("Performance", delay, RED1_BG, RED1_FG),
+        formula("Late Hrs", f'=AND(${perf}2="{delay}",${late}2<>"",'
+                            f'N(${late}2)*24>=24)', RED3_BG, RED3_FG),
+        formula("Late Hrs", f'=AND(${perf}2="{delay}",${late}2<>"",'
+                            f'N(${late}2)*24>=6)', RED2_BG, RED2_FG),
+        formula("Late Hrs", f'=AND(${perf}2="{delay}",${late}2<>"")',
+                RED1_BG, RED1_FG),
+    ]
+
+
+def _rgb(c) -> tuple:
+    return tuple(round(float((c or {}).get(k, 0.0)) * 255)
+                 for k in ("red", "green", "blue"))
+
+
+def _status_rules(ss, ws, batch):
+    """Keep the C1 rules in place on this tab. A rule is 'ours' when it
+    covers exactly one of our columns from row 2 down and paints one of our
+    palette colours; anything else (a user's own rule) is never touched.
+    Already correct and at the top -> nothing is sent."""
+    from tracking_suite.sheetio import _with_quota_retry
+    sid = ws.id
+    desired = _cf_rules()
+    palette = {_rgb(bg) for _, _, bg, _ in desired}
+    cols = {c for c, _, _, _ in desired}
+    try:
+        meta = _with_quota_retry(lambda: ss.fetch_sheet_metadata(params={
+            "fields": "sheets(properties(sheetId),conditionalFormats)"}),
+            "read colour rules")
+    except Exception as exc:
+        print(f"  [WARN] colour rules not checked this run: {str(exc)[:60]}",
+              flush=True)
+        return
+    existing = next((s.get("conditionalFormats", [])
+                     for s in meta.get("sheets", [])
+                     if s.get("properties", {}).get("sheetId", 0) == sid), [])
+
+    def sig(col, cond, bg):
+        return (col, cond.get("type"),
+                tuple(v.get("userEnteredValue", "")
+                      for v in cond.get("values", [])), _rgb(bg))
+
+    ours_idx, ours_sig = [], []
+    for i, rule in enumerate(existing):
+        br, rng = rule.get("booleanRule") or {}, rule.get("ranges") or []
+        if not br or len(rng) != 1:
+            continue
+        g = rng[0]
+        c = g.get("startColumnIndex", 0)
+        bg = (br.get("format") or {}).get("backgroundColor")
+        if g.get("sheetId", 0) == sid and g.get("startRowIndex", 0) == 1 \
+                and "endRowIndex" not in g and g.get("endColumnIndex") == c + 1 \
+                and c in cols and _rgb(bg) in palette:
+            ours_idx.append(i)
+            ours_sig.append(sig(c, br.get("condition") or {}, bg))
+    want = [sig(c, cond, bg) for c, cond, bg, _ in desired]
+    if ours_sig == want and ours_idx == list(range(len(want))):
+        return
+    for i in sorted(ours_idx, reverse=True):
+        batch.reqs.append({"deleteConditionalFormatRule": {"sheetId": sid,
+                                                          "index": i}})
+    for k, (c, cond, bg, fg) in enumerate(desired):
+        batch.reqs.append({"addConditionalFormatRule": {"index": k, "rule": {
+            "ranges": [{"sheetId": sid, "startRowIndex": 1,
+                        "startColumnIndex": c, "endColumnIndex": c + 1}],
+            "booleanRule": {"condition": cond, "format": {
+                "backgroundColor": bg,
+                "textFormat": {"foregroundColor": fg}}}}}})
+    print(f"  [Sheet] colour rules set ({len(desired)} rules, "
+          f"{len(ours_idx)} old removed)", flush=True)
+
+
 def _paint(ws, rows, title, batch):
     """Every semantic colour, appended to the run-wide write batch."""
     sid = ws.id
@@ -526,39 +671,14 @@ def _paint(ws, rows, title, batch):
                   "textFormat.foregroundColor,textFormat.italic)"}})
 
     H = tracker.HEADERS.index
-    STATUS_COLOR = {
-        tracker.S_RUNNING: (OK_BG, OK_FG),
-        tracker.S_LOADING: (AMBER_BG, AMBER_FG),
-        tracker.S_UNLOADING: (ORANGE_BG, ORANGE_FG),
-        tracker.S_AT_VIA: (BLUE_BG, BLUE_FG),
-        tracker.S_REVIEW: (REVIEW_BG, REVIEW_FG),
-    }
-    ARR_COLOR = {
-        tracker.A_TRANSIT: (BLUE_BG, BLUE_FG),
-        tracker.A_COMPLETED: (OK_BG, OK_FG),
-        tracker.A_NOT_ON_TRIP: (GREY_BG, GREY_FG),
-    }
     for i, r in enumerate(rows):
         rr = i + 1
         # trust lamp on Vehicle No
         cell(rr, H("Vehicle No"), TRUST_BG.get(r.get("_trust", "ok"),
                                                TRUST_BG["ok"]), None)
-        st = (r.get("Status") or "").strip()
-        if st in STATUS_COLOR:
-            cell(rr, H("Status"), *STATUS_COLOR[st])
-        elif st.upper() in tracker.MANUAL_STATUSES:
-            cell(rr, H("Status"), GREY_BG, GREY_FG)
-        arr = (r.get("ARRIVAL STATUS") or "").strip()
-        if arr in ARR_COLOR:
-            cell(rr, H("ARRIVAL STATUS"), *ARR_COLOR[arr])
-        perf = (r.get("Performance") or "").strip()
-        if perf == tracker.P_ONTIME:
-            cell(rr, H("Performance"), OK_BG, OK_FG)
-        elif perf == tracker.P_DELAY:
-            bg, fg = _delay_shade(_late_h(r.get("Late Hrs")))
-            cell(rr, H("Performance"), bg, fg)
-            if (r.get("Late Hrs") or "").strip():
-                cell(rr, H("Late Hrs"), bg, fg)
+        # Status / ARRIVAL STATUS / Performance / Late Hrs colours are
+        # conditional-format rules now (_status_rules, C1): they follow the
+        # value the moment anyone edits a cell, not only at the hourly paint.
         # a via waiting for its map pin: RED on the Via Point cell —
         # red = blocked on a human action, not an estimate
         if any(v.result in ("unknown hub", "pending hub")

@@ -820,12 +820,31 @@ def close_out_previous(old: dict, journal: str, live: dict, trail: list,
     return None
 
 
+def hand_status_line(prev_status: str, last_status: str | None,
+                     final_status: str) -> str:
+    """C3 (user, 2026-09-11). The Status cell differs from what the tracker
+    wrote last run, so a person typed it: say so in the journal, so that
+    knowledge survives even when this run replaces the value. Unknown last
+    value (None: no memory yet) -> no claim."""
+    prev = (prev_status or "").strip().upper()
+    if last_status is None or not prev \
+            or prev == (last_status or "").strip().upper():
+        return ""
+    fin = (final_status or "").strip().upper()
+    if fin == prev:
+        how = "kept" if prev in MANUAL_STATUSES else "tracker agrees"
+        return f"status set by hand: {prev} ({how})"
+    return (f"status set by hand: {prev} "
+            f"(tracker's reading: {final_status or 'blank'})")
+
+
 def build_row(vno: str, vtype: str, live: dict | None, trips: list,
               hubs: dict, index: list, tats: dict, existing: dict,
               now: datetime, sheet_tats: dict | None = None,
               pre_trail: list | None = None,
               via_prior: list | None = None,
-              paces: dict | None = None) -> dict:
+              paces: dict | None = None,
+              last_status: str | None = None) -> dict:
     atlas = Atlas(hubs, index)
     ev = Evidence()
     row = {h: "" for h in HEADERS}
@@ -1215,6 +1234,11 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
                 row["Performance"] = P_ONTIME if now <= sch else P_DELAY                     if sch else ""
                 if sch and now > sch:
                     row["Late Hrs"] = _hhmm((now - sch).total_seconds() / 60)
+
+    # 8b · C3: a status a person typed is journalled before it is replaced
+    hand = hand_status_line(prev_status, last_status, row.get("Status", ""))
+    if hand:
+        ev.log(hand)
 
     # 9 · the Remark journal: human lines untouched and first, machine events
     # dated and self-managed, volatile state on one "now — " line. A completed
