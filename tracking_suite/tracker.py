@@ -723,6 +723,91 @@ def _hhmm(minutes: float) -> str:
 #  ASSESSMENT — one pipeline, evidence-ranked
 # ═════════════════════════════════════════════════════════════════════════════
 
+CLOSE_OUT_AWAY_KM = 5.0   # D12: seen this far from the destination before an arrival counts
+
+
+def close_out_previous(old: dict, journal: str, live: dict, trail: list,
+                       atlas: "Atlas", new_dep: datetime | None,
+                       now: datetime, ev: Evidence) -> dict | None:
+    """D12 (user, 2026-09-11). A Trip ID the row carried over is dropped once
+    the site files a newer RPS (step 1 of build_row). The old trip then:
+      GPS saw it arrive at its pinned destination before the new trip began
+        -> a completion record (GPS arrival, via touching, its journal) for
+           the Completed Trips ledger, exactly like a normal completion;
+      FMS closed it but GPS never saw the arrival
+        -> nothing: the RPS scraper already takes the site's closure time;
+      no evidence it finished at all
+        -> a journal line on the new trip, so a human checks it."""
+    rid = str(old.get("rps") or "").strip()
+    segs = [atlas.resolve_ident(x) or x for x in (old.get("segs") or []) if x]
+    o = atlas.resolve_ident(old.get("origin") or "") or (segs[0] if segs else "")
+    d = atlas.resolve_ident(old.get("dest") or "") or (segs[-1] if segs else "")
+    vias = segs[1:-1] if len(segs) > 2 else []
+    start = old.get("start_dt")
+    bound = min(x for x in (new_dep, now) if x)
+    arrived, touch_h = None, 0.0
+    if rid and start and d in atlas.by_code and bound > start:
+        look = trail
+        if not look or look[0][0] > start:
+            # the trail must reach the departure; the 6 h before it is used
+            # when present, never fetched for. An empty fetch keeps what we had.
+            span_h = (now - start).total_seconds() / 3600 + 7
+            look = fetch_trail(live, now, hours=min(TRAIL_EXT_HOURS, span_h)) or look
+        before = [p for p in (look or []) if start - timedelta(hours=6) <= p[0] < start]
+        pts = [p for p in (look or []) if start <= p[0] <= bound]
+        dla, dlo = atlas.by_code[d][:2]
+        rad = max(atlas.rad(d), HUB_MIN_RADIUS)
+        dist = [haversine_m(la, lo, dla, dlo) for _, la, lo in pts]
+        inr = [m <= rad for m in dist]
+        # an arrival is only SEEN if the truck was first seen away from the
+        # destination: in the 6 h before departure (it sat at a far origin)
+        # or after it. A trip that starts inside or beside its destination
+        # (two hubs in one yard, e.g. NCR11 -> DLI11 at Binola) drifts in and
+        # out of the circle without arriving; GPS cannot witness that. When
+        # the journey itself was dark, the first ping inside is the time the
+        # truck is PROVEN there — the ledger takes that, never a guess.
+        away_before = any(haversine_m(la, lo, dla, dlo) >= CLOSE_OUT_AWAY_KM * 1000
+                          for _, la, lo in before)
+        far = 0 if away_before else next(
+            (k for k, m in enumerate(dist) if m >= CLOSE_OUT_AWAY_KM * 1000), None)
+        n = len(pts)
+        i = far if far is not None else n
+        while i < n and arrived is None:
+            if not inr[i]:
+                i += 1
+                continue
+            j, last, stray = i + 1, i, 0
+            while j < n:
+                if inr[j]:
+                    last, stray = j, 0
+                else:
+                    stray += 1
+                    if stray > 2:
+                        break
+                j += 1
+            if (pts[last][0] - pts[i][0]).total_seconds() >= 1800:
+                ent = pts[i][0]
+                fx = Fix(lat=pts[i][1], lon=pts[i][2], t=ent, age_h=0.0,
+                         fresh=True, raw_lat=pts[i][1], raw_lon=pts[i][2])
+                arrived = interp_arrival(pts, ent, fx, Evidence(),
+                                         dest=d, atlas=atlas)
+            i = last + 1
+        if arrived and vias:
+            visits = viatouch.assess(vias, [p for p in pts if p[0] <= arrived],
+                                     atlas, start, arrived)
+            touch_h = sum((v.dwell_h or 0.0) for v in visits
+                          if v.result in ("stopped", "stopped (in GPS gap)"))
+    short = rid.lstrip("0")
+    if arrived:
+        ev.note(f"previous trip {short} reached {d} {arrived:%d/%m %H:%M} "
+                f"(GPS) — sent to Completed Trips")
+        return {"rps": rid, "from": o, "to": d, "vias": vias, "dep": start,
+                "arrived": arrived, "touch_h": touch_h, "journal": journal}
+    if not old.get("end_dt"):
+        ev.log(f"previous trip {short} had no arrival evidence — check")
+    return None
+
+
 def build_row(vno: str, vtype: str, live: dict | None, trips: list,
               hubs: dict, index: list, tats: dict, existing: dict,
               now: datetime, sheet_tats: dict | None = None,
@@ -755,6 +840,7 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
         row["Remark"] = assemble_remark(prev_remark, prev_completed, ev, now)
         return row
 
+    closed_old, closed_journal = None, ""
     # 1 · trip context (site timestamps pass the gate exactly once)
     trip = read_trip(live, trips, atlas, now, ev)
     if manual_trip and not _same_trip_id(manual_trip, trip.trip_id):
@@ -771,6 +857,9 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
         if trip.trip_id and carried is not None \
                 and (shown is None or shown < carried):
             ev.log(f"trip {manual_trip} closed — site now shows {trip.trip_id}")
+            closed_old = next((t_ for t_ in trips if _same_trip_id(
+                t_.get("rps", ""), manual_trip)), None)
+            closed_journal = prev_remark
             manual_trip = ""
             prev_completed = True     # the old trip's journal leaves with it
         else:
@@ -980,6 +1069,14 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
                 row["ETA Date&Time"] = max(eta, now).strftime(_DT_OUT)
                 if basis != "lane pace":
                     ev.note(f"ETA from {basis} (no lane pace yet)")
+
+    # 5d · the trip this row just let go of (D12) — completed the normal
+    # way only when GPS saw it arrive; see close_out_previous.
+    if closed_old is not None:
+        cp = close_out_previous(closed_old, closed_journal, live, trail,
+                                atlas, trip.dep, now, ev)
+        if cp:
+            row["_closed_prev"] = cp
 
     # 6 · vias — the touching engine (viatouch.py). One verdict per via, in
     # route order, hiccup-tolerant: clean stays CONFIRMED, gap-edged stays

@@ -793,6 +793,27 @@ def _completed_write(ss, types, hubs, index, sheet_tats, rows, now,
                    make_rec(tid, vno, o, vias, d, start, end, "COMPLETED",
                             journal, touch_h))
 
+    # trips a board row let go of when the site filed a newer RPS, whose
+    # arrival GPS saw (tracker.close_out_previous, D12) — the same ledger
+    # row a normal completion makes, keyed on the RPS number
+    for r in rows:
+        cp = r.get("_closed_prev")
+        if not cp or not (cp.get("dep") and cp.get("arrived")
+                          and cp["arrived"] > cp["dep"]):
+            continue
+        vno = r["Vehicle No"]
+        journal = "; ".join(
+            ln.strip() for ln in str(cp.get("journal") or "").splitlines()
+            if ln.strip() and not ln.strip().startswith("now — ")
+            and not ln.strip().endswith("— trip completed"))
+        pk = find_pred(vno, cp["dep"])
+        if pk:
+            del byid[pk]
+        upsert(("rps", str(cp["rps"]).lstrip("0")),
+               make_rec(cp["rps"], vno, cp["from"], list(cp.get("vias") or []),
+                        cp["to"], cp["dep"], cp["arrived"], "COMPLETED",
+                        journal, cp.get("touch_h") or 0.0))
+
     out = list(byid.values())
     out.sort(key=lambda r: parse_dt(r.get("End_Time")) or datetime.min,
              reverse=True)
