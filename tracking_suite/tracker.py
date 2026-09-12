@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import median
+import bisect
 
 from tracking_suite import fms
 from tracking_suite import estimator
@@ -79,6 +80,7 @@ STATUS_VALUES = [S_RUNNING, S_LOADING, S_UNLOADING, S_AT_VIA, S_REVIEW,
 
 P_ONTIME = "*ON TIME"
 P_DELAY = "DELAY"
+P_RISK = "AT RISK"
 
 A_TRANSIT = "IN TRANSIT"
 A_COMPLETED = "COMPLETED"
@@ -820,6 +822,50 @@ def close_out_previous(old: dict, journal: str, live: dict, trail: list,
     return None
 
 
+_ETA_ERR_FILE = Path(__file__).resolve().parent / "eta_error.json"
+_ETA_ERR: dict | None = None
+
+
+def _eta_error_table() -> dict:
+    global _ETA_ERR
+    if _ETA_ERR is None:
+        try:
+            import json as _json
+            _ETA_ERR = _json.loads(_ETA_ERR_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            _ETA_ERR = {}
+    return _ETA_ERR
+
+
+def late_probability(eta: datetime, sch: datetime, now: datetime,
+                     table: dict | None = None) -> tuple | None:
+    """#1 (user, 2026-09-12). (P, median_error_h): the chance this truck
+    arrives more than 1 h after SCH, from how wrong our ETA has been at this
+    distance from arrival (eta_error.json, learned on 45 days of GPS: error =
+    real arrival - ETA, as quantiles per ETA-horizon bin). None when there is
+    no table for this horizon -> the caller uses the schedule rule."""
+    t = table if table is not None else _eta_error_table()
+    bins, qmap = t.get("bins_h") or [], t.get("quantiles") or {}
+    if not bins or not qmap:
+        return None
+    h = max(0.0, (eta - now).total_seconds() / 3600)
+    b = max(0, bisect.bisect_right(bins, h) - 1)
+    qs = qmap.get(str(b))
+    if not qs or len(qs) < 3:
+        return None
+    need = (sch + timedelta(hours=1) - eta).total_seconds() / 3600
+    n = len(qs) - 1
+    if need < qs[0]:
+        cdf = 0.0
+    elif need >= qs[-1]:
+        cdf = 1.0
+    else:
+        i = bisect.bisect_right(qs, need) - 1
+        lo, hi = qs[i], qs[i + 1]
+        cdf = (i + ((need - lo) / (hi - lo) if hi > lo else 1.0)) / n
+    return 1.0 - cdf, qs[n // 2]
+
+
 def hand_status_line(prev_status: str, last_status: str | None,
                      final_status: str) -> str:
     """C3 (user, 2026-09-11). The Status cell differs from what the tracker
@@ -1219,20 +1265,36 @@ def build_row(vno: str, vtype: str, live: dict | None, trips: list,
             if late_min > 0:
                 row["Late Hrs"] = _hhmm(late_min)
         else:
-            covered = _f(live.get("coveredDistance"))
-            total = _f(live.get("plannedDistance"))                 or ((covered or 0) + (_f(live.get("remainingDistance")) or 0))
-            elapsed_h = (now - trip.dep).total_seconds() / 3600
-            if covered is not None and total and total > 0:
-                progress = min(1.0, max(0.0, covered / total))
-                expected_h = tat_h * progress
-                behind_h = elapsed_h - expected_h
-                row["Performance"] = P_ONTIME if behind_h <= 1.0 else P_DELAY
-                if behind_h > 1.0:
-                    row["Late Hrs"] = _hhmm(behind_h * 60)
-            else:
-                # no distance telemetry — fall back to schedule comparison
-                row["Performance"] = P_ONTIME if now <= sch else P_DELAY                     if sch else ""
-                if sch and now > sch:
+            # #1: mid-trip Performance by probability (see late_probability).
+            # FMS's covered/planned counters are no longer used: they could
+            # restart at a via (HR55AP2977 read 42% done at 83%).
+            eta_dt = None
+            try:
+                eta_dt = datetime.strptime(row.get("ETA Date&Time") or "", _DT_OUT)
+            except ValueError:
+                eta_dt = None
+            pl = late_probability(eta_dt, sch, now) if (eta_dt and sch) else None
+            if pl is not None:
+                p, med_err = pl
+                tbl = _eta_error_table()
+                p_delay = float(tbl.get("p_delay", 0.9))
+                p_risk = float(tbl.get("p_risk", 0.6))
+                if p >= p_delay:
+                    row["Performance"] = P_DELAY
+                    late_min = (eta_dt + timedelta(hours=med_err) - sch
+                                ).total_seconds() / 60
+                    if late_min > 0:
+                        row["Late Hrs"] = _hhmm(late_min)
+                    ev.note(f"DELAY: {p:.0%} chance of arriving >1 h late")
+                elif p >= p_risk:
+                    row["Performance"] = P_RISK
+                    ev.note(f"AT RISK: {p:.0%} chance of arriving >1 h late")
+                else:
+                    row["Performance"] = P_ONTIME
+            elif sch:
+                # no ETA (route ends without pins / no pace) -> schedule rule
+                row["Performance"] = P_ONTIME if now <= sch else P_DELAY
+                if now > sch:
                     row["Late Hrs"] = _hhmm((now - sch).total_seconds() / 60)
 
     # 8b · C3: a status a person typed is journalled before it is replaced

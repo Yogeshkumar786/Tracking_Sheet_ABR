@@ -488,7 +488,7 @@ def _write(ss, title, rows, now, batch):
     batch.reqs += [
         dv(tracker.HEADERS.index("Status"), tracker.STATUS_VALUES),
         dv(tracker.HEADERS.index("Performance"),
-           [tracker.P_ONTIME, tracker.P_DELAY]),
+           [tracker.P_ONTIME, tracker.P_RISK, tracker.P_DELAY]),
         dv(tracker.HEADERS.index("ARRIVAL STATUS"), tracker.ARRIVAL_VALUES),
     ]
     _paint(ws, rows, title, batch)
@@ -567,6 +567,7 @@ def _cf_rules() -> list:
         eq("ARRIVAL STATUS", tracker.A_COMPLETED, OK_BG, OK_FG),
         eq("ARRIVAL STATUS", tracker.A_NOT_ON_TRIP, GREY_BG, GREY_FG),
         eq("Performance", tracker.P_ONTIME, OK_BG, OK_FG),
+        eq("Performance", tracker.P_RISK, AMBER_BG, AMBER_FG),
         formula("Performance", f'=AND(${perf}2="{delay}",N(${late}2)*24>=24)',
                 RED3_BG, RED3_FG),
         formula("Performance", f'=AND(${perf}2="{delay}",N(${late}2)*24>=6)',
