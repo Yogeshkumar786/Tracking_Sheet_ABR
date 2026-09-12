@@ -614,6 +614,9 @@ def _status_rules(ss, ws, batch):
                       for v in cond.get("values", [])), _rgb(bg))
 
     ours_idx, ours_sig = [], []
+    # Sheets stores an open-ended range with an endRowIndex (the grid size),
+    # so an end row must not disqualify a rule from being ours: requiring
+    # 'no endRowIndex' made every run add all 19 rules again.
     for i, rule in enumerate(existing):
         br, rng = rule.get("booleanRule") or {}, rule.get("ranges") or []
         if not br or len(rng) != 1:
@@ -622,7 +625,7 @@ def _status_rules(ss, ws, batch):
         c = g.get("startColumnIndex", 0)
         bg = (br.get("format") or {}).get("backgroundColor")
         if g.get("sheetId", 0) == sid and g.get("startRowIndex", 0) == 1 \
-                and "endRowIndex" not in g and g.get("endColumnIndex") == c + 1 \
+                and g.get("endColumnIndex") == c + 1 \
                 and c in cols and _rgb(bg) in palette:
             ours_idx.append(i)
             ours_sig.append(sig(c, br.get("condition") or {}, bg))
