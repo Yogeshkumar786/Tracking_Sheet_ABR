@@ -128,6 +128,10 @@ RPS_REPORT_HEADERS = {
                          "AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/148.0.0.0 Safari/537.36"),
 }
+# The portal's user group, the same one the report page's address names. Since
+# 16 Sep 2026 the web service refuses a request without it ("missing value for
+# parameter: 'UserGroup'", HTTP 500), so every batch failed and no trips came in.
+RPS_USER_GROUP      = "NRM.101"
 RPS_REQUEST_TIMEOUT = 60
 RPS_BATCH_SIZE      = 50
 
@@ -1033,6 +1037,7 @@ def fetch_rps_trips(vehicles: list[str],
     payload_base = {
         "from_time": from_dt.strftime("%Y-%m-%d 00:00:00"),
         "to_time":   to_dt.strftime("%Y-%m-%d 23:59:59"),
+        "UserGroup": RPS_USER_GROUP,
     }
     batches = [vehicles[i:i + RPS_BATCH_SIZE]
                for i in range(0, len(vehicles), RPS_BATCH_SIZE)] or [[]]
