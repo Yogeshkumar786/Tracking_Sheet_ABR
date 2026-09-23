@@ -95,6 +95,9 @@ def _endpoints(route: str) -> tuple[str, str]:
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
 
+RPS_USERGROUP = os.getenv("RPS_USERGROUP", "NRM.101")
+
+
 def _fetch_window(plates: list, frm: datetime, to: datetime) -> dict:
     """One batched sweep of the RPS report over [frm, to]."""
     from_time = frm.strftime("%Y-%m-%d %H:%M:%S")
@@ -103,9 +106,12 @@ def _fetch_window(plates: list, frm: datetime, to: datetime) -> dict:
     for i in range(0, len(plates), RPS_BATCH_SIZE):
         batch = plates[i:i + RPS_BATCH_SIZE]
         try:
+            # FMS change (Sep 2026): UserGroup became a REQUIRED parameter —
+            # without it every call is a 500 and the reports starve of trips.
             r = requests.post(RPS_REPORT_URL, headers=RPS_REPORT_HEADERS,
                               json={"from_time": from_time, "to_time": to_time,
-                                    "vehicleno": batch},
+                                    "vehicleno": batch,
+                                    "UserGroup": RPS_USERGROUP},
                               timeout=RPS_REQUEST_TIMEOUT, verify=False)
             r.raise_for_status()
             recs = _parse_rps_response(r.json())
