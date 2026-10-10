@@ -889,11 +889,12 @@ def build_row_values(rec: dict, vt_map: dict, sla_map: dict, rc_map: dict,
     start_raw = first(rec, F_START)
     end_raw   = first(rec, F_END)
     start_dt, end_dt = parse_dt_pair(start_raw, end_raw)
-    # V2: the tracker's GPS-verified end exists for many trips — the trip
-    # cannot have ended LATER than GPS shows, so the EARLIER of the two wins.
-    t_end = _TRACKER_ENDS.get(_normalize_rps(first(rec, F_RPS)))
-    if t_end and (end_dt is None or t_end < end_dt):
-        end_dt = t_end
+    # END TIME: what the RPS site says, and nothing else. The tracker's
+    # GPS end used to win wherever it was earlier -- a truck cannot arrive
+    # later than GPS shows -- but that put a time on the trip sheet that the
+    # site never said, and the sheet is what the hisaab, the TAT and the
+    # delay penalty are all read from afterwards. One source for it, and it
+    # is the one everybody else quotes back.
     start_cell = to_sheets_serial(start_dt) if start_dt else start_raw
     end_cell   = to_sheets_serial(end_dt)   if end_dt   else end_raw
 
@@ -1422,11 +1423,8 @@ def main():
                     tab_title, row_num, need_start, need_end = backfill[key]
                     start_dt2, end_dt2 = parse_dt_pair(
                         first(rec, F_START), first(rec, F_END))
-                    # blank End_Time can be filled by the tracker's GPS end
-                    # too — and when both exist, the EARLIER one wins
-                    t_end2 = _TRACKER_ENDS.get(key)
-                    if t_end2 and (end_dt2 is None or t_end2 < end_dt2):
-                        end_dt2 = t_end2
+                    # A blank end time fills from the site only; the
+                    # tracker's GPS end no longer stands in for it.
                     end_val   = to_sheets_serial(end_dt2)   if (need_end   and end_dt2)   else None
                     start_val = to_sheets_serial(start_dt2) if (need_start and start_dt2) else None
                     if end_val or start_val:
@@ -1567,9 +1565,9 @@ def main():
     # (a) Route_Code: an honest-NAME endpoint gets the tracker's verified
     #     code once it exists (a human-corrected cell holds a code → never
     #     touched).
-    # (b) End_Time: a cell that still holds EXACTLY what the site said —
-    #     proof no human edited it — is corrected to the tracker's GPS end
-    #     when that is EARLIER (a truck cannot arrive later than GPS shows).
+    # (b) End_Time: a blank cell is filled from the site. Nothing else
+    #     corrects it any more -- the tracker's GPS end used to overwrite a
+    #     machine-written time whenever it was earlier, and no longer does.
     site_ends: dict = {}
     for rec in records:
         k = _normalize_rps(first(rec, F_RPS))
@@ -1624,9 +1622,11 @@ def main():
                     cell_end = _from_sheets_serial(row[9]
                                                    if len(row) > 9 else None)
                     raw_end = str(row[9] if len(row) > 9 else "").strip()
-                    t_end = _TRACKER_ENDS.get(key)
+                    # The site's end is the only candidate now. The tracker's
+                    # GPS end is still gathered -- the lanes and touchings come
+                    # with it -- but it no longer corrects a time on the sheet.
                     s_end = site_ends.get(key)
-                    cands = [x for x in (t_end, s_end) if x]
+                    cands = [x for x in (s_end,) if x]
                     best = min(cands) if cands else None
                     if best and start_dt3 and best <= start_dt3:
                         best = None          # physics: end must follow start
